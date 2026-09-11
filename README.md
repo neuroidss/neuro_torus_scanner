@@ -253,7 +253,7 @@ Navigational dynamics are governed by the 4 canonical axes extracted from the 32
 3. **Temporal Bias ($ry \in [-1.0, +1.0]$):** Quantifies momentum shift between past low-gamma ($30\text{--}50\text{ Hz}$) and future high-gamma ($60\text{--}85\text{ Hz}$):
 
 ```math
-ry = \frac{|\text{traj}_{32}[31] - \text{traj}_{32}[16]| - |\text{traj}_{32}[16] - \text{traj}_{32}[0]|}{|\text{traj}_{32}[31] - \text{traj}_{32}[16]| + |\text{traj_{32}}[16] - \text{traj}_{32}[0]| + \epsilon}
+ry = \frac{|\text{traj}_{32}[31] - \text{traj}_{32}[16]| - |\text{traj}_{32}[16] - \text{traj}_{32}[0]|}{|\text{traj}_{32}[31] - \text{traj}_{32}[16]| + |\text{traj}_{32}[16] - \text{traj}_{32}[0]| + \epsilon}
 ```
 
 ### 5.3 Relative Path Integration vs. Absolute Cognitive Addressing

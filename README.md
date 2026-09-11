@@ -177,7 +177,7 @@ $$\text{Total Edges} = C_4^2 + C_{12}^2 + (4 \times 12) = 6 + 66 + 48 = 120$$
 ### 3.3 Causal Zero-Lag Rejection via Instantaneous Directed iPLV / ciPLV
 To eliminate instantaneous volume conduction ($\Delta \varphi = 0$) across the scalp without discarding phase directionality (Bruña, Maestú, & Pereda, J. Neural Eng. 2018; Nolte et al., Clin. Neurophysiol. 2004) [1.3.1, 1.7.1]:
 
-$$\mathrm{iPLV}_{ij}(t) = \Im\left\{ \frac{\dot{x}_i(t)}{|\dot{x}_i(t)|} \cdot \left(\frac{\dot{x}_j(t)}{|\dot{x}_j(t)|}\right)^* \right\} = \sin\left(\varphi_i(t) - \varphi_j(t)\right) \in [-1.0, +1.0]$$
+$$\mathrm{iPLV}_{ij}(t) = \Im\left\lbrace \frac{\dot{x}_i(t)}{|\dot{x}_i(t)|} \cdot \left(\frac{\dot{x}_j(t)}{|\dot{x}_j(t)|}\right)^* \right\rbrace = \sin\left(\varphi_i(t) - \varphi_j(t)\right) \in [-1.0, +1.0]$$
 
 Because $\sin(0) = 0$, any non-cerebral common-mode artifact (e.g., cranial muscle tension, eye blink, electrode polarization) vanishes from the 120-edge tensor.
 
@@ -209,13 +209,13 @@ $$\text{traj}_{32}(t) = \mathbf{gamma\_120}(t) \times \mathbf{W}, \quad \text{wh
 
 * **Initial State ($t = 0$, Untrained):**
 
-  $$\mathbf{W}_{\text{init}} = \begin{bmatrix} \Delta \vec{X}_{\text{pairs}} & \Delta \vec{Y}_{\text{pairs}} \end{bmatrix} \in \mathbb{R}^{120 \times 2}$$
+$$\mathbf{W}_{\text{init}} = \begin{bmatrix} \Delta \vec{X}_{\text{pairs}} & \Delta \vec{Y}_{\text{pairs}} \end{bmatrix} \in \mathbb{R}^{120 \times 2}$$
   
   The bridge is initialized to the physical electrode geometry. The system operates as a direct pass-through of cortical traveling waves.
 * **Continuous Online Adaptation (When Holding an Arrow Key):**
   Holding an arrow key generates a directional target vector $\vec{d}_{\text{target}} \in \{(0, 1), (-1, 0), (1, 0), (0, -1)\}$. The GPU executes AdamW micro-steps minimizing:
   
-  $$\mathcal{L} = \frac{1}{2} \| (\text{traj}_{32}[-1] - \text{traj}_{32}[0]) - \vec{d}_{\text{target}} \cdot 12.0 \|_2^2 + \lambda_1 \|\mathbf{W}\|_1$$
+$$\mathcal{L} = \frac{1}{2} \| (\text{traj}_{32}[-1] - \text{traj}_{32}[0]) - \vec{d}_{\text{target}} \cdot 12.0 \|_2^2 + \lambda_1 \|\mathbf{W}\|_1$$
   
 * **Zero Discontinuity:** Releasing the key stops parameter adaptation, while the forward pass $\text{traj}_{32} = \mathbf{gamma\_120} \times \mathbf{W}$ runs without modal switches or `blend_ratio` thresholds.
 
@@ -250,7 +250,7 @@ Navigational dynamics are governed by the 4 canonical axes extracted from the 32
    $$rx = \frac{1}{16 \cdot \|\vec{L}\|} \sum_{k=1}^{30} \left( L_x \cdot \text{traj}_y[k] - L_y \cdot \text{traj}_x[k] \right)$$
 3. **Temporal Bias ($ry \in [-1.0, +1.0]$):** Quantifies momentum shift between past low-gamma ($30\text{--}50\text{ Hz}$) and future high-gamma ($60\text{--}85\text{ Hz}$):
 
-   $$ry = \frac{\|\text{traj}_{32}[31] - \text{traj}_{32}[16]\| - \|\text{traj}_{32}[16] - \text{traj}_{32}[0]\|}{\|\text{traj}_{32}[31] - \text{traj}_{32}[16]\| + \|\text{traj}_{32}[16] - \text{traj}_{32}[0]\| + \epsilon}$$
+   $$ry = \frac{|\text{traj}_{32}[31] - \text{traj}_{32}[16]| - |\text{traj}_{32}[16] - \text{traj}_{32}[0]|}{|\text{traj}_{32}[31] - \text{traj}_{32}[16]| + |\text{traj_{32}}[16] - \text{traj}_{32}[0]| + \epsilon}$$
 
 ### 5.3 Relative Path Integration vs. Absolute Cognitive Addressing
 The system unifies both modes of cortical computation:

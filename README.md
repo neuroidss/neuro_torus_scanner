@@ -90,7 +90,7 @@ The neocortex utilizes a canonical microcircuit (Mountcastle, 1997; Hawkins et a
 | **Western Music** | Prefrontal Cortex | **Circle of Fifths** ($C \to G \to D \to A \dots$) [1.1.4] | **Circle of Thirds** (Major $\leftrightarrow$ Minor) [1.1.4] | Tonal Torus $\mathbb{T}^2$ (Janata et al., 2002) [1.1.4] |
 | **Speech Articulation** | Broca's / vSMC (FC5) | **Place of Articulation** (Labial $\to$ Alveolar $\to$ Velar) | **Syllable Phase** (Plosive $\to$ Vowel $\to$ Fricative) [1.1.2] | Phonetic Torus $\mathbb{T}^2$ (DIVA / SSIRH) [1.1.2] |
 | **Spatial Navigation** | Entorhinal Cortex | **Spatial Grid Axis X** ($x \pmod{\lambda}$) | **Spatial Grid Axis Y** ($y \pmod{\lambda}$) | Grid Torus $\mathbb{T}^2$ (Gardner et al., Nature 2022) [1.1.4] |
-| **Embodied Maze Flight** | Supplementary Motor (FCz) | **360° Planar Wave Heading** ($\text{atan2}(V_y, V_x)$) [1.2.7] | **Theta Carrier Phase** ($0 \dots 31$ Gamma Slots) [1.1.1, 1.1.2] | **Navigation Torus $\mathbb{T}^2$** [1.1.4] |
+| **Embodied Maze Flight** | Supplementary Motor (FCz) | **360° Planar Wave Heading** ($`\text{atan2}(V_y, V_x)`$) [1.2.7] | **Theta Carrier Phase** ($0 \dots 31$ Gamma Slots) [1.1.1, 1.1.2] | **Navigation Torus $\mathbb{T}^2$** [1.1.4] |
 
 ---
 
@@ -125,7 +125,7 @@ $$\vec{V}(t) = \begin{bmatrix} V_x(t) \\ V_y(t) \end{bmatrix} = \sum_{p=1}^{120}
 Rotating along the major ring corresponds to turning the compass orientation on the cortical sheet ($0^\circ \text{ East} \to 90^\circ \text{ North} \to 180^\circ \text{ West} \to 270^\circ \text{ South}$).
 
 ### 2.2 Minor Radius ($S^1_{\text{Poloidal}}$ / "The Donut Hole"): Theta Carrier Phase ($\Phi_\theta$) & 32 Gamma Slices
-The minor circumference of the torus (wrapping through the central hole) represents the **temporal phase progression of the endogenous theta carrier oscillation** ($\Phi_\theta \in [-\pi, +\pi)$):
+The minor circumference of the torus (wrapping through the central hole) represents the **temporal phase progression of the endogenous theta carrier oscillation** ($`\Phi_\theta \in [-\pi, +\pi)`$):
 * **Slices $0 \dots 10$ (Retrospective Anchor / Downbeat):** The phase origin $\Phi_\theta \approx -\pi$. Serves as the reference state against which subsequent phase rotations are compared (`past_anchor`).
 * **Slices $11 \dots 21$ (Present / Nucleus):** The midpoint $\Phi_\theta \approx 0$. Represents stationary trajectory maintenance on the manifold.
 * **Slices $22 \dots 31$ (Prospective Prediction / Coda):** The terminal phase $\Phi_\theta \approx +\pi$. Encodes the feedforward look-ahead prediction of the subsequent action chunk.

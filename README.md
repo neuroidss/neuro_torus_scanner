@@ -244,13 +244,17 @@ The maze is topologically closed onto the surface of a torus with dimensions $`\
 Navigational dynamics are governed by the 4 canonical axes extracted from the 32-step trajectory:
 1. **Primary Intent Vector ($\vec{L} = (lx, ly)$):** Computed from the displacement between the retrospective anchor and prospective prediction:
 
-   $$\vec{L} = \text{traj}_{32}[31] - \text{traj}_{32}[0]$$
+```math
+\vec{L} = \text{traj}_{32}[31] - \text{traj}_{32}[0]
+```
    
 2. **Sagitta Curvature ($rx \in [-1.0, +1.0]$):** Measures the lateral deflection of intermediate slices ($k = 1 \dots 30$) from the chord $\vec{L}$, providing turning moments:
    $$rx = \frac{1}{16 \cdot \|\vec{L}\|} \sum_{k=1}^{30} \left( L_x \cdot \text{traj}_y[k] - L_y \cdot \text{traj}_x[k] \right)$$
 3. **Temporal Bias ($ry \in [-1.0, +1.0]$):** Quantifies momentum shift between past low-gamma ($30\text{--}50\text{ Hz}$) and future high-gamma ($60\text{--}85\text{ Hz}$):
 
-   $$ry = \frac{|\text{traj}_{32}[31] - \text{traj}_{32}[16]| - |\text{traj}_{32}[16] - \text{traj}_{32}[0]|}{|\text{traj}_{32}[31] - \text{traj}_{32}[16]| + |\text{traj_{32}}[16] - \text{traj}_{32}[0]| + \epsilon}$$
+```math
+ry = \frac{|\text{traj}_{32}[31] - \text{traj}_{32}[16]| - |\text{traj}_{32}[16] - \text{traj}_{32}[0]|}{|\text{traj}_{32}[31] - \text{traj}_{32}[16]| + |\text{traj_{32}}[16] - \text{traj}_{32}[0]| + \epsilon}
+```
 
 ### 5.3 Relative Path Integration vs. Absolute Cognitive Addressing
 The system unifies both modes of cortical computation:

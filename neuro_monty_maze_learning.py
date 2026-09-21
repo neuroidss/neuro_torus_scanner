@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-🧠 NEUROCANVAS × MONTY: SEPARATE GOAL & SENSOR SYSTEMS WITH AUTONOMOUS TAKEOVER
-- Разделение систем по канонам tbp.monty:
-    * MazeSensorModule (SM): знает ТОЛЬКО локальные стены (никакого знания о выходе).
-    * HippocampalGoalGenerator (GSG): ведет когнитивную карту и знает, где выход.
-    * MontyFrontalLM (LM): связывает локальные стены, цель и моторное намерение человека.
-- Переключение режимов по нажатию [ПРОБЕЛ]:
-    * [HUMAN BCI]: Человек ведет аватар через FCz, Monty учится повторять ваши решения.
-    * [MONTY AUTONOMOUS]: Monty сам управляет аватаром на основе выученного у вас!
-- Честная оценка автономии (0..100%): растет по мере того, как Monty точно угадывает ваш выбор.
-- 100% эталонная стрелка человека (желтая/бирюзовая) + стрелка автопилота Monty (пурпурная).
+🧠 NEUROCANVAS × VLA-JEPA: EGOCENTRIC ROTATING MAP & 3D ACTIVE INFERENCE
+- Эгоцентрическая вращающаяся 2D-карта: Аватар всегда смотрит ВВЕРХ, мир крутится вокруг него.
+- Управление в координатах тела: Вперед = туда, куда смотрит аватар; Вбок = стрейф.
+- Поворот влево вращает карту вправо (как в Quake / авиагоризонте).
+- 32-точечный фазовый кометный шлейф (Lisman & Jensen 2013) ориентирован по телу аватара.
+- Высокоскоростной GPU Raycaster (CUDA) питает V-JEPA 3D-видеопотоком.
 """
 
 import os
@@ -19,563 +15,554 @@ import math
 import time
 from collections import deque
 import numpy as np
+import cv2
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import pygame
 
 from neuro_heterarchy_core import (
-    HeterarchicalBrainEngine, NUM_FREQS, NUM_PAIRS, DEVICE, NodeState, SCALE_28_120
+    HeterarchicalBrainEngine, DEVICE
 )
-from tbp.monty.cmp import Message, Goal
+from vla_jepa_wrapper import VLA_JEPA_Wrapper
 
 DIM = 11
 CELL_SIZE = 56
 MAZE_W = DIM * CELL_SIZE
 MAZE_H = DIM * CELL_SIZE
 
+CAM_W, CAM_H = 256, 256 
+
+ELECTRODE_X = np.array([10.14, 7.43, 2.75, 2.72, -2.72, -2.75, -7.42, -10.14,
+                        -10.14, -7.43, -2.75, -2.72, 2.72, 2.75, 7.43, 10.14], dtype=np.float32)
+ELECTRODE_Y = np.array([-2.72, -7.43, -4.77, -10.15,-10.14, -4.77, -7.42,  -2.73,
+                         2.72,  7.43,  4.76, 10.14, 10.15,  4.77,  7.42,   2.71], dtype=np.float32)
+
 # ==============================================================================
-# 1. ЛАБИРИНТ
+# ТОПОЛОГИЧЕСКИЙ ЛАБИРИНТ (2D GRID)
 # ==============================================================================
 class TopoMaze:
     def __init__(self, dim=DIM):
-        self.dim = dim
-        self.grid = [[1 for _ in range(dim)] for _ in range(dim)]
+        self.dim = dim if dim % 2 != 0 else dim + 1
+        self.grid = [[1 for _ in range(self.dim)] for _ in range(self.dim)]
         self._gen(1, 1)
-        self.exit_pos = (dim - 2, dim - 2)
+        
+        self.exit_pos = (self.dim - 2, self.dim - 2)
         self.grid[self.exit_pos[1]][self.exit_pos[0]] = 2
-        self.dist_map = self._compute_bfs()
-        self.bake_surface()
+        self.grid[self.exit_pos[1] - 1][self.exit_pos[0]] = 0
+        self.grid[self.exit_pos[1]][self.exit_pos[0] - 1] = 0
 
     def _gen(self, x, y):
         self.grid[y][x] = 0
-        dirs = [(0, 2), (0, -2), (2, 0), (-2, 0)]
+        dirs = [(0, -1), (0, 1), (-1, 0), (1, 0)]
         np.random.shuffle(dirs)
         for dx, dy in dirs:
-            nx, ny = x + dx, y + dy
+            nx, ny = x + dx * 2, y + dy * 2
             if 0 < nx < self.dim - 1 and 0 < ny < self.dim - 1 and self.grid[ny][nx] == 1:
-                self.grid[y + dy // 2][x + dx // 2] = 0
+                self.grid[y + dy][x + dx] = 0
                 self._gen(nx, ny)
 
-    def _compute_bfs(self):
-        dist = np.full((self.dim, self.dim), 999.0, dtype=np.float32)
-        ex, ey = self.exit_pos
-        dist[ey, ex] = 0.0
-        q = deque([(ex, ey)])
-        while q:
-            cx, cy = q.popleft()
-            cd = dist[cy, cx]
-            for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
-                nx, ny = cx + dx, cy + dy
-                if 0 <= nx < self.dim and 0 <= ny < self.dim:
-                    if self.grid[ny][nx] != 1 and dist[ny, nx] > cd + 1.0:
-                        dist[ny, nx] = cd + 1.0
-                        q.append((nx, ny))
-        return dist
-
-    def get_distance_at(self, x: float, y: float) -> float:
-        gx = int(np.clip(math.floor(x), 0, self.dim - 1))
-        gy = int(np.clip(math.floor(y), 0, self.dim - 1))
-        base_d = self.dist_map[gy, gx]
-        ex, ey = self.exit_pos[0] + 0.5, self.exit_pos[1] + 0.5
-        return float(base_d + math.hypot(x - ex, y - ey) * 0.05)
-
-    def is_wall(self, gx, gy):
-        if gx < 0 or gx >= self.dim or gy < 0 or gy >= self.dim: return True
-        return self.grid[int(gy)][int(gx)] == 1
-
-    def bake_surface(self):
-        self.baked_surface = pygame.Surface((MAZE_W, MAZE_H), pygame.SRCALPHA)
-        self.baked_surface.fill((0, 0, 0, 0))
-        for gy in range(self.dim):
-            for gx in range(self.dim):
-                if self.grid[gy][gx] == 1:
-                    rect = (gx * CELL_SIZE, gy * CELL_SIZE, CELL_SIZE, CELL_SIZE)
-                    pygame.draw.rect(self.baked_surface, (12, 18, 28), rect)
-                    pygame.draw.rect(self.baked_surface, (25, 42, 60), rect, 1)
-                elif self.grid[gy][gx] == 2:
-                    cx = int((gx + 0.5) * CELL_SIZE)
-                    cy = int((gy + 0.5) * CELL_SIZE)
-                    pygame.draw.circle(self.baked_surface, (0, 255, 120, 50), (cx, cy), int(CELL_SIZE * 0.45))
-                    pygame.draw.circle(self.baked_surface, (0, 255, 120), (cx, cy), int(CELL_SIZE * 0.28))
-                    pygame.draw.circle(self.baked_surface, (255, 255, 255), (cx, cy), int(CELL_SIZE * 0.12))
+    def is_wall(self, gx: float, gy: float) -> bool:
+        ix, iy = int(math.floor(gx)), int(math.floor(gy))
+        if ix < 0 or ix >= self.dim or iy < 0 or iy >= self.dim: return True
+        return self.grid[iy][ix] == 1
 
 # ==============================================================================
-# 2. ФИЗИЧЕСКИЙ АВАТАР СО СКОЛЬЖЕНИЕМ
+# GPU ТЕКСТУРИРОВАННЫЙ 3D РЕЙКАСТЕР (CUDA)
 # ==============================================================================
-class WallSlidingAvatar:
+class GPURaycaster(nn.Module):
+    def __init__(self, dim=DIM, cam_w=CAM_W, cam_h=CAM_H, device=DEVICE):
+        super().__init__()
+        self.dim, self.w, self.h, self.device = dim, cam_w, cam_h, device
+        self.fov = math.pi / 3.0
+        self.d_steps = torch.linspace(0.04, 11.0, 180, device=device)
+        self.ray_offsets = torch.linspace(-self.fov / 2.0, self.fov / 2.0, self.w, device=device)
+        self.cos_offsets = torch.cos(self.ray_offsets)
+        self.y_coords = torch.arange(self.h, device=device)[:, None]
+        
+        self.bg = torch.zeros((self.h, self.w, 3), dtype=torch.uint8, device=device)
+        self.bg[:self.h // 2, :, :] = 35
+        self.bg[self.h // 2:, :, :] = 55
+
+    def render(self, grid_list: list[list[int]], x: float, y: float, angle: float) -> np.ndarray:
+        with torch.no_grad():
+            grid_gpu = torch.tensor(grid_list, dtype=torch.uint8, device=self.device)
+            angles = angle + self.ray_offsets
+            dx, dy = torch.cos(angles), torch.sin(angles)
+            
+            sample_x = (x + dx[:, None] * self.d_steps[None, :]).clamp(0, self.dim - 1.001)
+            sample_y = (y + dy[:, None] * self.d_steps[None, :]).clamp(0, self.dim - 1.001)
+            
+            ix, iy = sample_x.long(), sample_y.long()
+            cell_types = grid_gpu[iy, ix]
+            hits = (cell_types > 0)
+            has_hit = hits.any(dim=1)
+            
+            first_hit_idx = torch.argmax(hits.float(), dim=1)
+            dist = torch.where(has_hit, self.d_steps[first_hit_idx], torch.tensor(11.0, device=self.device))
+            dist_corr = dist * self.cos_offsets
+            
+            hit_x = torch.where(has_hit, sample_x[torch.arange(self.w, device=self.device), first_hit_idx], torch.zeros(self.w, device=self.device))
+            hit_y = torch.where(has_hit, sample_y[torch.arange(self.w, device=self.device), first_hit_idx], torch.zeros(self.w, device=self.device))
+            tex_u = ((hit_x + hit_y) * 3.0) % 1.0
+            
+            hit_types = torch.where(has_hit, cell_types[torch.arange(self.w, device=self.device), first_hit_idx], torch.zeros(self.w, dtype=torch.uint8, device=self.device))
+            
+            wall_heights = (self.h / (dist_corr + 1e-4)).long().clamp(0, self.h)
+            wall_top = ((self.h - wall_heights) // 2).clamp(0, self.h)
+            wall_bot = (wall_top + wall_heights).clamp(0, self.h)
+            
+            shades = (255.0 / (1.0 + dist**2 * 0.12)).clamp(0, 255).byte()
+            
+            frame = torch.zeros((self.h, self.w, 3), dtype=torch.uint8, device=self.device)
+            floor_y = self.y_coords[self.h // 2:] - (self.h // 2) + 1
+            floor_stripes = (((30.0 / floor_y.float()) % 1.0 < 0.18).byte() * 40).unsqueeze(-1)
+            frame[self.h // 2:, :, :] = 40 + floor_stripes
+            frame[:self.h // 2, :, :] = 25
+            
+            wall_mask = (self.y_coords >= wall_top[None, :]) & (self.y_coords < wall_bot[None, :])
+            tex_v = ((self.y_coords.float() - wall_top[None, :].float()) / (wall_heights.float()[None, :] + 1e-4) * 4.0) % 1.0
+            is_mortar = (tex_u[None, :] < 0.12) | (tex_v < 0.12)
+            
+            r_wall = torch.where(hit_types == 2, torch.zeros_like(shades), shades)
+            g_wall = shades
+            b_wall = torch.where(hit_types == 2, (shades // 2), torch.clamp(shades.float() * 1.15, 0, 255).byte())
+            base_col = torch.stack([r_wall, g_wall, b_wall], dim=-1)
+            textured_col = torch.where(is_mortar[:, :, None], (base_col.float() * 0.35).byte(), base_col)
+            
+            frame = torch.where(wall_mask[:, :, None], textured_col, frame)
+            return frame.cpu().numpy()
+
+# ==============================================================================
+# АВАТАР С ЭГОЦЕНТРИЧЕСКОЙ КИНЕМАТИКОЙ (BODY-FRAME)
+# ==============================================================================
+class Avatar3D:
     def __init__(self):
         self.x, self.y = 1.5, 1.5
+        self.angle = math.pi / 2.0  # Смотрит на Север (+Y)
         self.vx, self.vy = 0.0, 0.0
-        self.angle = -math.pi / 2.0
         self.persistence = 0.0
-        self.last_ix, self.last_iy = 0.0, 0.0
-        self.wm_turn_curve = 0.0
-        self.temporal_bias = 0.0
-        self.actual_dx = 0.0
-        self.actual_dy = 0.0
-        self.progress_delta = 0.0
+        self.last_fwd, self.last_str = 0.0, 0.0
         self.trail = []
-
-    def update_physics(self, dt, force_x, force_y, wm_curvature, temp_bias, maze: TopoMaze):
-        self.wm_turn_curve = wm_curvature
-        self.temporal_bias = temp_bias
-
-        mag = math.hypot(force_x, force_y)
-        if mag > 0.05:
-            last_mag = math.hypot(self.last_ix, self.last_iy) + 1e-6
-            dot = (force_x * self.last_ix + force_y * self.last_iy) / (mag * last_mag)
-            alignment = max(0.0, dot)
-        else:
-            alignment = 0.0
-
+        
+    def update_motion(self, dt, fwd_drive, strafe_drive, turn_rate, maze):
+        # 1. Поворот камеры (угол тела)
+        self.angle += turn_rate * dt
+        self.angle = (self.angle + math.pi) % (2.0 * math.pi) - math.pi
+        
+        # 2. Персистентность движения
+        mag = math.hypot(fwd_drive, strafe_drive)
+        alignment = max(0.0, (fwd_drive * self.last_fwd + strafe_drive * self.last_str) / (mag * math.hypot(self.last_fwd, self.last_str) + 1e-6)) if mag > 0.05 else 0.0
         self.persistence = self.persistence * 0.95 + 0.05 * alignment * math.tanh(mag * 2.0)
-        self.last_ix, self.last_iy = force_x, force_y
+        self.last_fwd, self.last_str = fwd_drive, strafe_drive
 
-        accel_multiplier = 1.0 + temp_bias
-        active_boost = 1.0 + self.persistence * 4.0
-        base_speed = 3.4 * active_boost * accel_multiplier
+        speed = 3.2 * (1.0 + self.persistence * 2.5)
+        
+        # 3. Перевод из координат тела (Forward/Strafe) в мировые координаты (X/Y)
+        # При angle = pi/2 (вверх): Forward = (0, 1), Strafe = (1, 0)
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
+        
+        target_vx = (fwd_drive * cos_a + strafe_drive * sin_a) * speed
+        target_vy = (fwd_drive * sin_a - strafe_drive * cos_a) * speed
+        
+        self.vx = self.vx * 0.82 + target_vx * 0.18
+        self.vy = self.vy * 0.82 + target_vy * 0.18
 
-        target_vx = force_x * base_speed
-        target_vy = force_y * base_speed
-
-        MAX_SPEED = 9.0
-        t_mag = math.hypot(target_vx, target_vy)
-        if t_mag > MAX_SPEED:
-            target_vx = (target_vx / t_mag) * MAX_SPEED
-            target_vy = (target_vy / t_mag) * MAX_SPEED
-
-        self.vx = self.vx * 0.86 + target_vx * 0.14
-        self.vy = self.vy * 0.86 + target_vy * 0.14
-
-        dist_before = maze.get_distance_at(self.x, self.y)
-
+        # 4. Движение с проверкой стен
         move_dist = math.hypot(self.vx, self.vy) * dt
         steps = max(1, int(math.ceil(move_dist / 0.04)))
-        sdx = (self.vx * dt) / steps
-        sdy = (self.vy * dt) / steps
-        r = 0.22
+        sdx, sdy = (self.vx * dt) / steps, (self.vy * dt) / steps
+        r = 0.25
 
-        old_x, old_y = self.x, self.y
         for _ in range(steps):
-            if not maze.is_wall(self.x + sdx + math.copysign(r, sdx), self.y):
-                self.x += sdx
-            if not maze.is_wall(self.x, self.y + sdy + math.copysign(r, sdy)):
-                self.y += sdy
-
-        self.actual_dx = self.x - old_x
-        self.actual_dy = self.y - old_y
-
-        dist_after = maze.get_distance_at(self.x, self.y)
-        self.progress_delta = dist_before - dist_after
-
-        reached_exit = False
-        if int(self.x) == maze.exit_pos[0] and int(self.y) == maze.exit_pos[1]:
-            reached_exit = True
-            maze.__init__(DIM)
-            self.x, self.y = 1.5, 1.5
-
+            if not maze.is_wall(self.x + sdx + math.copysign(r, sdx), self.y): self.x += sdx
+            if not maze.is_wall(self.x, self.y + sdy + math.copysign(r, sdy)): self.y += sdy
+            
         self.trail.append((self.x, self.y))
         if len(self.trail) > 35: self.trail.pop(0)
 
-        return reached_exit
+# ==============================================================================
+# CORTICAL HTM ENGINE
+# ==============================================================================
+class CanonicalHTMColumn(nn.Module):
+    def __init__(self, num_columns=4096, k_active=80, num_slots=32):
+        super().__init__()
+        self.num_columns, self.k_active, self.num_slots = num_columns, k_active, num_slots
+        ex, ey = [], []
+        for i in range(16):
+            for j in range(i + 1, 16):
+                ex.append((ELECTRODE_X[i] + ELECTRODE_X[j]) / 2.0)
+                ey.append((ELECTRODE_Y[i] + ELECTRODE_Y[j]) / 2.0)
+        self.register_buffer("edge_x", torch.tensor(ex, device=DEVICE))
+        self.register_buffer("edge_y", torch.tensor(ey, device=DEVICE))
+        grid_dim = int(math.isqrt(num_columns))
+        cy = torch.linspace(-11.0, 11.0, grid_dim, device=DEVICE).view(grid_dim, 1, 1)
+        cx = torch.linspace(-11.0, 11.0, grid_dim, device=DEVICE).view(1, grid_dim, 1)
+        d_sq = (cx - self.edge_x.view(1, 1, 120))**2 + (cy - self.edge_y.view(1, 1, 120))**2
+        self.register_buffer("permanence", torch.exp(-d_sq / 40.0).view(-1, 120)[:num_columns])
+        self.perm_threshold = 0.25
+
+    def compute_sdr(self, pac_iplv_32x120: torch.Tensor) -> torch.Tensor:
+        connected = (self.permanence >= self.perm_threshold).float()
+        x_clean = torch.relu(pac_iplv_32x120)
+        if torch.max(x_clean) < 1e-5:
+            return torch.full((self.num_slots, self.num_columns), 1e-4, device=DEVICE)
+        overlap = torch.matmul(x_clean, connected.T) / torch.sum(connected, dim=1).clamp(min=1.0)
+        _, active_indices = torch.topk(overlap, self.k_active, dim=-1)
+        sdr_seq = torch.full((self.num_slots, self.num_columns), 0.01, device=DEVICE)
+        sdr_seq.scatter_(1, active_indices, 1.0)
+        return sdr_seq
+
+class FrontalExecutiveHeterarchy(nn.Module):
+    def __init__(self, num_nodes=1, max_capacity=16, num_columns_per_node=4096, k_active_per_node=80, num_slots=32):
+        super().__init__()
+        self.max_capacity, self.num_slots = max_capacity, num_slots
+        self.total_dim = num_columns_per_node * num_nodes
+        self.nodes = nn.ModuleList([CanonicalHTMColumn(k_active=k_active_per_node, num_slots=num_slots) for _ in range(num_nodes)])
+        self.register_buffer("trajectory_weights", torch.full((max_capacity, num_slots, self.total_dim), 0.05, device=DEVICE))
+        self.register_buffer("calcium_trajectory", torch.zeros((num_slots, self.total_dim), device=DEVICE))
+        self.register_buffer("membrane_potential", torch.zeros(max_capacity, device=DEVICE))
+
+    def get_current_sdr(self, iplv_gamma_nodes: list[torch.Tensor]):
+        sdrs = [self.nodes[i].compute_sdr(iplv_gamma_nodes[i]) if i < len(iplv_gamma_nodes) else torch.zeros((self.num_slots, 4096), device=DEVICE) for i in range(len(self.nodes))]
+        return torch.cat(sdrs, dim=-1), sdrs[0]
+
+    def contrastive_learn(self, target_idx: int, num_active: int, lr=0.05, ltd_factor=0.5):
+        if torch.max(self.calcium_trajectory) > 1e-5 and abs(lr) > 1e-6:
+            self.trajectory_weights[target_idx] = torch.clamp(self.trajectory_weights[target_idx] + lr * self.calcium_trajectory, 0.01, 1.0)
+            for o_idx in range(num_active):
+                if o_idx != target_idx:
+                    self.trajectory_weights[o_idx] = torch.clamp(self.trajectory_weights[o_idx] - (lr * ltd_factor) * self.calcium_trajectory, 0.01, 1.0)
+
+    def predict_evidence(self, cur_sdr_seq: torch.Tensor, active_count: int, dt=0.016, tau=0.250):
+        self.calcium_trajectory = torch.max(self.calcium_trajectory * 0.88, cur_sdr_seq)
+        w_flat = self.trajectory_weights[:active_count].view(active_count, -1)
+        s_flat = self.calcium_trajectory.view(-1)
+        current = torch.mv(F.normalize(w_flat, p=2, dim=1), F.normalize(s_flat, p=2, dim=0))
+        alpha = dt / tau
+        self.membrane_potential[:active_count] = (1.0 - alpha) * self.membrane_potential[:active_count] + alpha * current
+        wm_scores = torch.clamp(self.membrane_potential[:active_count], 0.0, 1.0) * 100.0
+        weights = torch.softmax(self.membrane_potential[:active_count] * 8.0, dim=0).cpu().numpy()
+        return weights, wm_scores.cpu().numpy()
 
 # ==============================================================================
-# 3. СЕНСОРНЫЙ МОДУЛЬ (SM) — ЗНАЕТ ТОЛЬКО ЛОКАЛЬНЫЕ СТЕНЫ
+# VLA-JEPA MONTY (БЕЗ АДАМА, ЧИСТАЯ СИНАПТИЧЕСКАЯ ПЛАСТИЧНОСТЬ)
 # ==============================================================================
-class MazeSensorModule:
-    """
-    Сенсорный орган Monty: знает только то, что чувствует вокруг себя в радиусе 0.35 клеток.
-    Никакого знания о выходе или глобальной карте у него нет!
-    """
-    def process(self, avatar: WallSlidingAvatar, maze: TopoMaze) -> Message:
-        x, y = avatar.x, avatar.y
-        r = 0.38
+class MontyVLA:
+    def __init__(self, jepa_dim=2048, htm_dim=16):
+        self.max_capacity = htm_dim
+        self.jepa_dim = jepa_dim
+        self.heterarchy = FrontalExecutiveHeterarchy(num_nodes=1, max_capacity=htm_dim).to(DEVICE)
         
-        # Локальное ощущение препятствий по 4 направлениям
-        wall_n = float(maze.is_wall(x, y - r))
-        wall_s = float(maze.is_wall(x, y + r))
-        wall_e = float(maze.is_wall(x + r, y))
-        wall_w = float(maze.is_wall(x - r, y))
-
-        return Message(
-            location=np.array([x, y, 0.0], dtype=np.float64),
-            morphological_features={
-                "pose_vectors": np.eye(3, dtype=np.float64),
-                "pose_fully_defined": True,
-                "on_object": 1.0,
-            },
-            non_morphological_features={
-                "wall_north": wall_n,
-                "wall_south": wall_s,
-                "wall_east":  wall_e,
-                "wall_west":  wall_w,
-            },
-            confidence=1.0,
-            pass_message=True,
-            sender_id="Local_SM",
-            sender_type="SM",
-            process_features_in_lm=True
-        )
-
-# ==============================================================================
-# 4. КОГНИТИВНАЯ КАРТА И ГЕНЕРАТОР ЦЕЛИ (GSG) — ЗНАЕТ, ГДЕ ВЫХОД
-# ==============================================================================
-class HippocampalGoalGenerator:
-    """
-    Энторинально-гиппокампальная система: ведет глобальную аллоцентрическую карту.
-    Именно она знает, где находится выход, и вычисляет идеальный вектор градиента к цели.
-    """
-    def generate_goal(self, avatar: WallSlidingAvatar, maze: TopoMaze) -> Goal:
-        cur_d = maze.get_distance_at(avatar.x, avatar.y)
+        self.concept_to_latent = torch.randn((htm_dim, jepa_dim), device=DEVICE)
+        self.concept_to_latent = F.normalize(self.concept_to_latent, p=2, dim=1)
         
-        # Пробные смещения в 4 стороны для нахождения направления скорейшего спуска
-        eps = 0.4
-        d_n = maze.get_distance_at(avatar.x, avatar.y - eps) if not maze.is_wall(avatar.x, avatar.y - eps) else 999.0
-        d_s = maze.get_distance_at(avatar.x, avatar.y + eps) if not maze.is_wall(avatar.x, avatar.y + eps) else 999.0
-        d_e = maze.get_distance_at(avatar.x + eps, avatar.y) if not maze.is_wall(avatar.x + eps, avatar.y) else 999.0
-        d_w = maze.get_distance_at(avatar.x - eps, avatar.y) if not maze.is_wall(avatar.x - eps, avatar.y) else 999.0
-
-        min_d = min(d_n, d_s, d_e, d_w)
+        # Синапсы моторного вывода (Body Frame: Forward, Strafe)
+        self.action_weights = torch.zeros((2, jepa_dim + htm_dim), device=DEVICE)
         
-        gx, gy = 0.0, 0.0
-        if min_d < 900.0:
-            if min_d == d_n: gy = -1.0
-            elif min_d == d_s: gy = 1.0
-            elif min_d == d_e: gx = 1.0
-            elif min_d == d_w: gx = -1.0
-
-        return Goal(
-            location=np.array([maze.exit_pos[0] + 0.5, maze.exit_pos[1] + 0.5, 0.0], dtype=np.float64),
-            morphological_features=None,
-            non_morphological_features={
-                "ideal_dir_x": gx,
-                "ideal_dir_y": gy,
-                "dist_to_exit": cur_d
-            },
-            confidence=float(np.clip(1.0 / (cur_d + 1.0), 0.05, 1.0)),
-            pass_message=True,
-            sender_id="Hippocampal_GSG",
-            sender_type="GSG",
-            process_features_in_lm=True,
-            goal_tolerances=None
-        )
-
-# ==============================================================================
-# 5. ИСПОЛНИТЕЛЬНАЯ КОЛОНКА MONTY (УЧИТСЯ У МОЗГА И УМЕЕТ РУЛИТЬ САМА)
-# ==============================================================================
-class MontyAutonomousExecutive:
-    """
-    Лобная колонка Monty:
-    - Принимает сенсорику от SM (локальные стены) и цель от GSG (вектор к выходу).
-    - В режиме УЧИТЕЛЯ (HUMAN): смотрит, как человек рулит через FCz, и учит политику.
-    - В режиме АВТОПИЛОТА (MONTY): генерирует (force_x, force_y) самостоятельно!
-    """
-    def __init__(self):
-        # Ассоциативная матрица политики: связывает [Стены 4 + Цель 2] -> [Действие 4]
-        # 6 входных признаков -> 4 направления
-        self.weights = torch.zeros((4, 6), device=DEVICE, dtype=torch.float32)
-        
-        # Статистика совпадений предсказаний Monty с намерениями человека
-        self.match_history = deque(maxlen=150)
-        self.autonomy_score = 0.0      # 0..100% готовность автопилота
+        self.autonomy_score = 0.0
         self.total_learned_steps = 0
+        self.match_history = deque(maxlen=150)
+        
+        self.last_jepa_emb = None
+        self.latent_velocity = 0.0
+        self.jepa_cosine_sim = 0.0
+        self.wm_scores = np.zeros(htm_dim)
 
-        self.last_monty_fx = 0.0
-        self.last_monty_fy = 0.0
+    def learn_from_human(self, iplv_gamma_np: np.ndarray, jepa_emb: torch.Tensor, human_fwd: float, human_str: float, dt: float):
+        mag = math.hypot(human_fwd, human_str)
+        jepa_emb_flat = jepa_emb.view(-1)
+        
+        if self.last_jepa_emb is not None:
+            self.latent_velocity = torch.norm(jepa_emb_flat - self.last_jepa_emb).item()
+        self.last_jepa_emb = jepa_emb_flat.clone()
+        
+        if mag < 0.01: return self.autonomy_score
 
-    def get_state_vector(self, sm_msg: Message, gsg_goal: Goal) -> torch.Tensor:
-        walls = sm_msg.non_morphological_features
-        g_feat = gsg_goal.non_morphological_features
-        # Вектор состояния: [Wall_N, Wall_S, Wall_E, Wall_W, Goal_Gx, Goal_Gy]
-        s = [
-            walls["wall_north"],
-            walls["wall_south"],
-            walls["wall_east"],
-            walls["wall_west"],
-            g_feat["ideal_dir_x"],
-            g_feat["ideal_dir_y"]
-        ]
-        return torch.tensor(s, device=DEVICE, dtype=torch.float32)
-
-    def predict_action(self, state_vec: torch.Tensor) -> tuple[float, float, int]:
-        """Monty вычисляет собственное действие по выученным весам."""
-        with torch.no_grad():
-            scores = torch.mv(self.weights, state_vec)
-            # Отсекаем направления, где стена
-            if state_vec[0] > 0.5: scores[0] -= 5.0  # North
-            if state_vec[1] > 0.5: scores[1] -= 5.0  # South
-            if state_vec[2] > 0.5: scores[2] -= 5.0  # East
-            if state_vec[3] > 0.5: scores[3] -= 5.0  # West
-
-            best_dir = int(torch.argmax(scores).item())
-            
-            # Перевод дискретного направления в плавный вектор силы
-            # 0: Вперед (-Y), 1: Назад (+Y), 2: Вправо (+X), 3: Влево (-X)
-            dir_vectors = [
-                (0.0, -1.0),
-                (0.0,  1.0),
-                (1.0,  0.0),
-                (-1.0, 0.0)
-            ]
-            fx, fy = dir_vectors[best_dir]
-            self.last_monty_fx = fx
-            self.last_monty_fy = fy
-            return fx, fy, best_dir
-
-    def learn_from_human(self, state_vec: torch.Tensor, human_fx: float, human_fy: float, is_moving: bool):
-        """Обучение на демонстрации человека с FCz."""
-        if not is_moving:
-            return 0.0, False
-
-        # Определение направления человека
-        if abs(human_fy) >= abs(human_fx):
-            human_dir = 0 if human_fy < 0 else 1
-        else:
-            human_dir = 2 if human_fx > 0 else 3
-
-        # Что предсказал Monty до обучения?
-        _, _, monty_dir = self.predict_action(state_vec)
-        is_match = (monty_dir == human_dir)
-        self.match_history.append(1.0 if is_match else 0.0)
-
-        # Обучение на аномалиях: если Monty не угадал — обновляем синапсы
-        if not is_match:
-            lr = 0.05
-            # Укрепляем связь текущего состояния со сделанным человеком выбором
-            self.weights[human_dir] += lr * state_vec
-            # Ослабляем ошибочно предсказанный вариант
-            self.weights[monty_dir] -= lr * 0.5 * state_vec
-            self.weights = torch.clamp(self.weights, -1.0, 3.0)
-            self.total_learned_steps += 1
-
-        # Расчет честного индекса автономии (0% на старте)
+        t_iplv = torch.tensor(iplv_gamma_np, dtype=torch.float32, device=DEVICE)
+        full_sdr_seq, _ = self.heterarchy.get_current_sdr([t_iplv])
+        
+        # 1. Ассоциация HTM
+        similarities = torch.matmul(self.concept_to_latent, jepa_emb_flat)
+        target_idx = int(torch.argmax(similarities).item())
+        self.heterarchy.contrastive_learn(target_idx, self.max_capacity, lr=0.05, ltd_factor=0.5)
+        
+        # 2. Выравнивание Ойя
+        self.concept_to_latent[target_idx] += 0.05 * (jepa_emb_flat - self.concept_to_latent[target_idx])
+        self.concept_to_latent[target_idx] = F.normalize(self.concept_to_latent[target_idx], p=2, dim=0)
+        
+        # 3. Дельта-правило для моторных синапсов (Widrow-Hoff)
+        weights, self.wm_scores = self.heterarchy.predict_evidence(full_sdr_seq, self.max_capacity, dt=dt)
+        htm_intent = torch.tensor(weights, dtype=torch.float32, device=DEVICE)
+        
+        pred_jepa = torch.matmul(htm_intent, self.concept_to_latent)
+        self.jepa_cosine_sim = F.cosine_similarity(pred_jepa.unsqueeze(0), jepa_emb_flat.unsqueeze(0)).item()
+        
+        vla_state = torch.cat([jepa_emb_flat, htm_intent], dim=0)
+        pred_action = torch.matmul(self.action_weights, vla_state)
+        target_action = torch.tensor([human_fwd, human_str], dtype=torch.float32, device=DEVICE)
+        
+        error = target_action - pred_action
+        self.action_weights += 0.02 * torch.outer(error, vla_state)
+        
+        self.total_learned_steps += 1
+        loss_val = torch.sum(error**2).item()
+        self.match_history.append(1.0 if loss_val < 0.18 else 0.0)
         if len(self.match_history) >= 15:
-            acc = float(np.mean(self.match_history))
-            maturity = min(1.0, self.total_learned_steps / 80.0)
-            self.autonomy_score = acc * maturity * 100.0
-        else:
-            self.autonomy_score = 0.0
+            self.autonomy_score = float(np.mean(self.match_history)) * min(1.0, self.total_learned_steps / 80.0) * 100.0
+            
+        return self.autonomy_score
 
-        return self.autonomy_score, is_match
+    def step_inference(self, iplv_gamma_np: np.ndarray, jepa_emb: torch.Tensor, dt: float) -> tuple[float, float]:
+        t_iplv = torch.tensor(iplv_gamma_np, dtype=torch.float32, device=DEVICE)
+        full_sdr_seq, _ = self.heterarchy.get_current_sdr([t_iplv])
+        
+        weights, self.wm_scores = self.heterarchy.predict_evidence(full_sdr_seq, self.max_capacity, dt=dt)
+        htm_intent = torch.tensor(weights, dtype=torch.float32, device=DEVICE)
+        
+        jepa_emb_flat = jepa_emb.view(-1)
+        vla_state = torch.cat([jepa_emb_flat, htm_intent], dim=0)
+        
+        pred_action = torch.matmul(self.action_weights, vla_state)
+        return float(pred_action[0].item()), float(pred_action[1].item())
 
 # ==============================================================================
-# 6. ОСНОВНОЙ ЦИКЛ ПРИЛОЖЕНИЯ
+# MAIN
 # ==============================================================================
 def main():
-    import multiprocessing as mp
-    mp.freeze_support()
-
     pygame.init()
     flags = pygame.HWSURFACE | pygame.DOUBLEBUF
-    screen = pygame.display.set_mode((1380, 760), flags, vsync=0)
-    pygame.display.set_caption("NeuroCanvas × Monty: Human BCI vs Autonomous Pilot [SPACE to Toggle]")
+    screen = pygame.display.set_mode((1420, 820), flags, vsync=0)
+    pygame.display.set_caption("NeuroCanvas × VLA-JEPA | Rotating Egocentric Map (125 FPS)")
     clock = pygame.time.Clock()
 
     engine = HeterarchicalBrainEngine()
     engine.start()
 
+    jepa = VLA_JEPA_Wrapper(port=6001, device=DEVICE)
+
     maze = TopoMaze(DIM)
-    avatar = WallSlidingAvatar()
+    avatar = Avatar3D()
+    raycaster = GPURaycaster(dim=maze.dim, cam_w=CAM_W, cam_h=CAM_H, device=DEVICE)
+    monty = MontyVLA(jepa_dim=jepa.jepa_dim, htm_dim=16)
 
-    # Раздельные системы по Monty:
-    sm = MazeSensorModule()
-    gsg = HippocampalGoalGenerator()
-    monty = MontyAutonomousExecutive()
-
-    N_elements = 2
-    lead_idx = 0
-    sample_indices = np.linspace(0, NUM_FREQS - 1, N_elements, dtype=int)
-
-    # РЕЖИМ УПРАВЛЕНИЯ: False = Человек с FCz, True = Автопилот Monty!
-    AUTONOMOUS_MONTY_MODE = False
+    AUTOPILOT_MODE = False
 
     try:
         while True:
-            dt = clock.tick(60) / 1000.0
+            dt = clock.tick(120) / 1000.0
             dt = min(0.05, dt)
 
+            turn_rate_key = 0.0
             for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    raise KeyboardInterrupt
+                if event.type == pygame.QUIT: raise KeyboardInterrupt
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_SPACE:
-                        AUTONOMOUS_MONTY_MODE = not AUTONOMOUS_MONTY_MODE
-                        mode_tag = "АВТОПИЛОТ MONTY" if AUTONOMOUS_MONTY_MODE else "УПРАВЛЕНИЕ МОЗГОМ (FCz)"
-                        print(f"🔄 [РЕЖИМ ПЕРЕКЛЮЧЕН]: {mode_tag}")
-                    elif pygame.K_1 <= event.key <= pygame.K_4:
-                        lead_idx = event.key - pygame.K_1
+                        AUTOPILOT_MODE = not AUTOPILOT_MODE
                     elif event.key == pygame.K_r:
                         maze = TopoMaze(DIM)
                         avatar.x, avatar.y = 1.5, 1.5
 
+            keys = pygame.key.get_pressed()
+            if keys[pygame.K_q] or keys[pygame.K_LEFT]:  turn_rate_key += 2.8 # Поворот влево
+            if keys[pygame.K_e] or keys[pygame.K_RIGHT]: turn_rate_key -= 2.8 # Поворот вправо
+
             frame = engine.get_frame()
-            nodes = [frame.fcz_macro, frame.pz_spatial, frame.oz_sensory, frame.cz_motor]
-            lead_node = nodes[lead_idx]
-
-            # Вектор человека с FCz
+            lead_node = frame.fcz_macro
             axes = lead_node.gamepad_axes
-            human_fx = axes.lx
-            human_fy = -axes.ly
-            wm_curvature = axes.rx
-            temporal_bias = axes.ry
 
-            # 1. Сенсорный модуль считывает стены
-            sm_msg = sm.process(avatar, maze)
-
-            # 2. Гиппокамп выдает цель и направление к выходу
-            gsg_goal = gsg.generate_goal(avatar, maze)
-
-            # 3. Monty формирует вектор состояния и предсказывает действие
-            s_vec = monty.get_state_vector(sm_msg, gsg_goal)
-            monty_fx, monty_fy, monty_pred_dir = monty.predict_action(s_vec)
-
-            # 4. ВЫБОР ДРАЙВЕРА: Человек или Автопилот Monty?
-            if AUTONOMOUS_MONTY_MODE:
-                # Рулит Monty!
-                drive_fx = monty_fx
-                drive_fy = monty_fy
-            else:
-                # Рулит Человек с FCz!
-                drive_fx = human_fx
-                drive_fy = human_fy
-
-            # Шаг физики в лабиринте
-            solved = avatar.update_physics(dt, drive_fx, drive_fy, wm_curvature, temporal_bias, maze)
-
-            # Обучение Monty на действиях человека (если рулит человек)
-            step_len = math.hypot(avatar.actual_dx, avatar.actual_dy)
-            is_moving = (step_len >= 0.001)
+            # 1. 3D Текстурированный рендер на CUDA
+            frame_3d_np = raycaster.render(maze.grid, avatar.x, avatar.y, avatar.angle)
             
-            if not AUTONOMOUS_MONTY_MODE:
-                autonomy_ready, matched = monty.learn_from_human(s_vec, human_fx, human_fy, is_moving)
+            # 2. V-JEPA Эмбеддинг
+            jepa_tensor = jepa.encode_world_state(frame_3d_np)
+            if isinstance(jepa_tensor, torch.Tensor):
+                real_jepa_emb = jepa_tensor.mean(dim=1).squeeze(0).to(DEVICE)
             else:
-                autonomy_ready = monty.autonomy_score
-                matched = True
+                real_jepa_emb = torch.tensor(jepa_tensor).mean(dim=1).squeeze(0).to(DEVICE)
+            real_jepa_emb = F.normalize(real_jepa_emb, p=2, dim=0)
+
+            # 3. УПРАВЛЕНИЕ В BODY-FRAME (КООРДИНАТЫ ТЕЛА АВАТАРА)
+            # Человек: Вперед/Назад (-ly), Стрейф (lx), Поворот (сагитта rx + клавиши)
+            human_fwd = -axes.ly
+            human_str = axes.lx
+            human_turn = -axes.rx * 3.2 + turn_rate_key
+
+            # Клавиатурный дубляж движения (WASD)
+            if keys[pygame.K_w] or keys[pygame.K_UP]:    human_fwd += 1.0
+            if keys[pygame.K_s] or keys[pygame.K_DOWN]:  human_fwd -= 1.0
+            if keys[pygame.K_d]:                         human_str += 1.0
+            if keys[pygame.K_a]:                         human_str -= 1.0
+
+            human_mag = math.hypot(human_fwd, human_str)
+
+            # 4. ОБУЧЕНИЕ ИЛИ АВТОПИЛОТ
+            if not AUTOPILOT_MODE:
+                drive_fwd, drive_str = human_fwd, human_str
+                monty.learn_from_human(lead_node.iplv_gamma, real_jepa_emb, human_fwd, human_str, dt)
+                monty_fwd, monty_str = monty.step_inference(lead_node.iplv_gamma, real_jepa_emb, dt)
+            else:
+                monty_fwd, monty_str = monty.step_inference(lead_node.iplv_gamma, real_jepa_emb, dt)
+                drive_fwd, drive_str = monty_fwd, monty_str
+
+            avatar.update_motion(dt, drive_fwd, drive_str, human_turn, maze)
 
             # ==================================================================
-            # ОТРИСОВКА
+            # РЕНДЕРИНГ ЭГОЦЕНТРИЧЕСКОЙ ВРАЩАЮЩЕЙСЯ КАРТЫ
             # ==================================================================
-            screen.fill((6, 8, 12))
+            screen.fill((8, 11, 16))
+            
+            # Размеры вьюпорта 2D-карты
             ox, oy = 30, 45
+            cx_ui = MAZE_W // 2
+            cy_ui = MAZE_H // 2
+            
+            maze_surface_ui = pygame.Surface((MAZE_W, MAZE_H), pygame.SRCALPHA)
+            
+            # Математическая проекция мира во вращающийся экран:
+            # Аватар всегда смотрит ВВЕРХ (Forward), мир поворачивается на угол (-angle)
+            def to_ego(wx, wy):
+                dx = wx - avatar.x
+                dy = wy - avatar.y
+                # Скалярное произведение с локальным Right и Forward
+                # sin(angle) и cos(angle)
+                sx = cx_ui + int((dx * math.sin(avatar.angle) - dy * math.cos(avatar.angle)) * CELL_SIZE)
+                sy = cy_ui + int((-dx * math.cos(avatar.angle) - dy * math.sin(avatar.angle)) * CELL_SIZE)
+                return (sx, sy)
 
-            maze_surface = pygame.Surface((MAZE_W, MAZE_H), pygame.SRCALPHA)
-            maze_surface.fill((0, 0, 0, 0))
-            maze_surface.blit(maze.baked_surface, (0, 0))
+            # Отрисовка вращающихся полигонов лабиринта (11x11 = 121 клетка, мгновенно)
+            for gy in range(maze.dim):
+                for gx in range(maze.dim):
+                    if maze.grid[gy][gx] == 1:
+                        p0 = to_ego(gx, gy)
+                        p1 = to_ego(gx + 1, gy)
+                        p2 = to_ego(gx + 1, gy + 1)
+                        p3 = to_ego(gx, gy + 1)
+                        pygame.draw.polygon(maze_surface_ui, (16, 22, 32), [p0, p1, p2, p3])
+                        pygame.draw.polygon(maze_surface_ui, (30, 42, 60), [p0, p1, p2, p3], 1)
+                    elif maze.grid[gy][gx] == 2:
+                        exit_center = to_ego(gx + 0.5, gy + 0.5)
+                        pygame.draw.circle(maze_surface_ui, (0, 255, 120), exit_center, 16)
+                        pygame.draw.circle(maze_surface_ui, (255, 255, 255), exit_center, 5)
 
-            px = int(avatar.x * CELL_SIZE)
-            py = int(avatar.y * CELL_SIZE)
-
+            # Шлейф аватара во вращающихся координатах
             if len(avatar.trail) > 1:
-                trail_pts = [(int(tx * CELL_SIZE), int(ty * CELL_SIZE)) for tx, ty in avatar.trail]
-                t_col = (255, 80, 200) if AUTONOMOUS_MONTY_MODE else (0, 180, 255)
-                pygame.draw.lines(maze_surface, t_col, False, trail_pts, 2)
+                trail_pts = [to_ego(tx, ty) for tx, ty in avatar.trail]
+                t_col = (255, 80, 200) if AUTOPILOT_MODE else (0, 180, 255)
+                pygame.draw.lines(maze_surface_ui, t_col, False, trail_pts, 2)
 
             # -------------------------------------------------------------
-            # 1. СТРЕЛКА ЧЕЛОВЕКА (ЖЕЛТАЯ / БИРЮЗОВАЯ ИЗ FCz)
+            # 32-ТОЧЕЧНАЯ КОМЕТА ТЕТА-ГАММА РАБОЧЕЙ ПАМЯТИ (Lisman-Jensen)
             # -------------------------------------------------------------
-            VEC_SCALE = 120.0
-            spline_pts = [(px, py)]
-            base_gx = lead_node.traj_32[0, 0]
-            base_gy = lead_node.traj_32[0, 1]
-            for idx_k in sample_indices[1:]:
-                sk_x = lead_node.traj_32[idx_k, 0] - base_gx
-                sk_y = lead_node.traj_32[idx_k, 1] - base_gy
-                sk_len = math.hypot(sk_x, sk_y)
-                if sk_len > 1.0: sk_x /= sk_len; sk_y /= sk_len
-                sp_x = px + sk_x * VEC_SCALE
-                sp_y = py + sk_y * VEC_SCALE
-                spline_pts.append((int(sp_x), int(sp_y)))
+            traj_2d = lead_node.traj_32 # [32, 2]
+            base_tx, base_ty = traj_2d[0, 0], traj_2d[0, 1]
+            comet_pts = []
+            for k in range(32):
+                # В координатах тела: X = strafe, Y = forward
+                c_str = (traj_2d[k, 0] - base_tx) * 12.0
+                c_fwd = (traj_2d[k, 1] - base_ty) * 12.0
+                comet_pts.append((cx_ui + int(c_str), cy_ui - int(c_fwd)))
+            
+            for k in range(31):
+                col_c = int(255 * (k / 31.0))
+                pygame.draw.line(maze_surface_ui, (col_c, 255 - col_c, 255), comet_pts[k], comet_pts[k+1], 3)
+            pygame.draw.circle(maze_surface_ui, (255, 255, 255), comet_pts[-1], 4)
 
-            # Вектор человека
-            pygame.draw.line(maze_surface, (0, 255, 255), spline_pts[0], spline_pts[1], 4)
-            pygame.draw.circle(maze_surface, (255, 255, 255), spline_pts[1], 5)
+            # ДИНАМИЧЕСКИЙ ВЕКТОР ЧЕЛОВЕКА (БИРЮЗОВЫЙ)
+            VEC_SCALE = 80.0
+            if human_mag > 0.02:
+                h_len = min(1.5, human_mag) * VEC_SCALE * (1.0 + avatar.persistence * 0.4)
+                h_end_x = cx_ui + int((human_str / human_mag) * h_len)
+                h_end_y = cy_ui - int((human_fwd / human_mag) * h_len)
+                pygame.draw.line(maze_surface_ui, (0, 255, 255), (cx_ui, cy_ui), (h_end_x, h_end_y), 4)
+                pygame.draw.circle(maze_surface_ui, (255, 255, 255), (h_end_x, h_end_y), 5)
 
-            # -------------------------------------------------------------
-            # 2. СТРЕЛКА MONTY (ПУРПУРНАЯ / САЛАТОВАЯ — АВТОПИЛОТ)
-            # -------------------------------------------------------------
-            m_end_x = px + int(monty_fx * 70.0)
-            m_end_y = py + int(monty_fy * 70.0)
-            pygame.draw.line(maze_surface, (255, 60, 180), (px, py), (m_end_x, m_end_y), 3)
-            pygame.draw.circle(maze_surface, (255, 120, 220), (m_end_x, m_end_y), 4)
+            # ДИНАМИЧЕСКИЙ ВЕКТОР MONTY (ПУРПУРНЫЙ)
+            m_mag = math.hypot(monty_fwd, monty_str)
+            if m_mag > 0.02:
+                m_len = min(1.5, m_mag) * VEC_SCALE * (monty.autonomy_score / 100.0 + 0.3)
+                m_end_x = cx_ui + int((monty_str / m_mag) * m_len)
+                m_end_y = cy_ui - int((monty_fwd / m_mag) * m_len)
+                pygame.draw.line(maze_surface_ui, (255, 60, 180), (cx_ui, cy_ui), (m_end_x, m_end_y), 3)
+                pygame.draw.circle(maze_surface_ui, (255, 120, 220), (m_end_x, m_end_y), 4)
 
-            # Аватар
-            av_col = (255, 50, 200) if AUTONOMOUS_MONTY_MODE else (0, 255, 200)
-            pygame.draw.circle(maze_surface, av_col, (px, py), 13)
-            pygame.draw.circle(maze_surface, (255, 255, 255), (px, py), 4)
+            # Аватар (всегда в центре и смотрит строго ВВЕРХ)
+            av_col = (255, 50, 200) if AUTOPILOT_MODE else (0, 255, 200)
+            pygame.draw.circle(maze_surface_ui, av_col, (cx_ui, cy_ui), 13)
+            pygame.draw.circle(maze_surface_ui, (255, 255, 255), (cx_ui, cy_ui), 4)
+            # Желтая стрелочка носа аватара (всегда вверх)
+            pygame.draw.line(maze_surface_ui, (255, 255, 0), (cx_ui, cy_ui), (cx_ui, cy_ui - 26), 3)
+            pygame.draw.circle(maze_surface_ui, (255, 255, 0), (cx_ui, cy_ui - 26), 3)
 
-            screen.blit(maze_surface, (ox, oy))
-            border_col = (255, 50, 200) if AUTONOMOUS_MONTY_MODE else (0, 200, 255)
-            pygame.draw.rect(screen, border_col, (ox, oy, MAZE_W, MAZE_H), 2)
+            # Стрелка компаса: указывает на мировой СЕВЕР (+Y)
+            north_pt = to_ego(avatar.x + 0.0, avatar.y + 1.2)
+            pygame.draw.line(maze_surface_ui, (255, 60, 60), (cx_ui, cy_ui), north_pt, 2)
+            f_xs = pygame.font.SysFont("consolas", 11, bold=True)
+            maze_surface_ui.blit(f_xs.render("N", True, (255, 80, 80)), (north_pt[0] - 4, north_pt[1] - 12))
 
-            # ==================================================================
-            # ПАНЕЛЬ УПРАВЛЕНИЯ И АВТОНОМИИ MONTY (ПРАВАЯ СТОРОНА)
-            # ==================================================================
-            rx = 690
+            screen.blit(maze_surface_ui, (ox, oy))
+            pygame.draw.rect(screen, (40, 60, 80), (ox, oy, MAZE_W, MAZE_H), 2)
+
+            # --- 3D SENSOR VIEW СПРАВА ---
+            surf_3d = pygame.surfarray.make_surface(frame_3d_np.swapaxes(0, 1))
+            surf_3d_scaled = pygame.transform.scale(surf_3d, (384, 384))
+            screen.blit(surf_3d_scaled, (670, 45))
+            pygame.draw.rect(screen, (0, 255, 200), (670, 45, 384, 384), 2)
+
+            # --- ПАНЕЛИ ТЕЛЕМЕТРИИ ---
             f_b = pygame.font.SysFont("consolas", 13, bold=True)
             f_s = pygame.font.SysFont("consolas", 11)
-            f_huge = pygame.font.SysFont("consolas", 26, bold=True)
-
-            pygame.draw.rect(screen, (12, 16, 24), (rx, 45, 650, 225), border_radius=6)
-            mode_col = (255, 60, 180) if AUTONOMOUS_MONTY_MODE else (0, 255, 200)
-            pygame.draw.rect(screen, mode_col, (rx, 45, 650, 225), 2, border_radius=6)
-
-            mode_title = "► АВТОПИЛОТ MONTY [АКТИВЕН] (РУЛИТ MONTY)" if AUTONOMOUS_MONTY_MODE else "► УЧИТЕЛЬ: МОЗГ ЧЕЛОВЕКА [FCz BCI] (MONTY УЧИТСЯ)"
-            screen.blit(f_b.render(mode_title, True, mode_col), (rx + 15, 55))
-            screen.blit(f_huge.render(f"ГОТОВНОСТЬ АВТОНОМИИ: {monty.autonomy_score:.1f}%", True, mode_col), (rx + 15, 80))
-
-            # Шкала готовности к передаче руля
-            bar_w = 400
-            pygame.draw.rect(screen, (25, 35, 45), (rx + 15, 120, bar_w, 16), border_radius=4)
-            fill_w = int(np.clip(monty.autonomy_score / 100.0, 0.0, 1.0) * bar_w)
-            pygame.draw.rect(screen, mode_col, (rx + 15, 120, fill_w, 16), border_radius=4)
-
-            screen.blit(f_s.render(f"• [ПРОБЕЛ]: ПЕРЕКЛЮЧИТЬ УПРАВЛЕНИЕ (Человек <-> Monty)", True, (255, 255, 100)), (rx + 15, 145))
-            screen.blit(f_s.render(f"• Бирюзовая стрелка: Намерение мозга человека (FCz)", True, (0, 255, 255)), (rx + 15, 165))
-            screen.blit(f_s.render(f"• Пурпурная стрелка: Решение автопилота Monty (Frontal LM)", True, (255, 60, 180)), (rx + 15, 185))
-            screen.blit(f_s.render(f"• Совпадение предсказаний: {float(np.mean(monty.match_history))*100.0 if monty.match_history else 0.0:.1f}% | Шагов обучения: {monty.total_learned_steps}", True, (180, 200, 220)), (rx + 15, 205))
-            screen.blit(f_s.render(f"• Сенсорный модуль SM: чувствует только стены! Цель ведет GSG.", True, (140, 150, 160)), (rx + 15, 225))
-
-            # Блок телеметрии систем
-            pygame.draw.rect(screen, (12, 16, 24), (rx, 285, 650, 85), border_radius=6)
-            pygame.draw.rect(screen, (35, 45, 60), (rx, 285, 650, 85), 1, border_radius=6)
-
-            walls = sm_msg.non_morphological_features
-            w_str = f"N:{int(walls['wall_north'])} S:{int(walls['wall_south'])} E:{int(walls['wall_east'])} W:{int(walls['wall_west'])}"
-            screen.blit(f_b.render(f"СЕНСОРНЫЙ МОДУЛЬ (SM): Локальные стены вокруг: [{w_str}]", True, (0, 255, 200)), (rx + 15, 295))
             
-            g_feat = gsg_goal.non_morphological_features
-            screen.blit(f_s.render(f"• Гиппокамп (GSG): Дистанция до выхода: {g_feat['dist_to_exit']:.1f} шагов | Градиент: ({g_feat['ideal_dir_x']:+.1f}, {g_feat['ideal_dir_y']:+.1f})", True, (255, 200, 100)), (rx + 15, 320))
-            screen.blit(f_s.render(f"• Исполнительная колонка (LM): Предсказывает: [{monty.class_names[monty_pred_dir]}]", True, (255, 100, 200)), (rx + 15, 340))
+            # Панель 1: V-JEPA World Model
+            dx_p, dy_p = 1070, 45
+            pygame.draw.rect(screen, (14, 18, 26), (dx_p, dy_p, 325, 384), border_radius=6)
+            pygame.draw.rect(screen, (0, 200, 255), (dx_p, dy_p, 325, 384), 1, border_radius=6)
+            
+            screen.blit(f_b.render("V-JEPA 2 WORLD EMBEDDINGS", True, (0, 200, 255)), (dx_p + 12, dy_p + 12))
+            screen.blit(f_s.render(f"Port: 6001 | Dim: {jepa.jepa_dim}D", True, (150, 180, 210)), (dx_p + 12, dy_p + 35))
+            screen.blit(f_s.render(f"Ego-Velocity ||dz||: {monty.latent_velocity:.3f}", True, (255, 220, 50)), (dx_p + 12, dy_p + 58))
+            screen.blit(f_s.render("  (>0.1 = Оптический поток детектирован)", True, (120, 140, 160)), (dx_p + 12, dy_p + 75))
+            
+            sim_col = (100, 255, 100) if monty.jepa_cosine_sim > 0.70 else (255, 180, 50)
+            screen.blit(f_b.render(f"World Prediction Sim: {monty.jepa_cosine_sim:.3f}", True, sim_col), (dx_p + 12, dy_p + 105))
 
-            # Радары узлов
-            colors = [(255, 50, 200), (0, 200, 255), (100, 255, 100), (255, 180, 0)]
-            for i, n in enumerate(nodes):
-                ry_ui = 385 + i * 90
-                col = colors[i]
-                is_lead = (i == lead_idx)
+            screen.blit(f_b.render("TOP HTM WORKING MEMORY (L2/3):", True, (255, 120, 220)), (dx_p + 12, dy_p + 155))
+            top_concepts = np.argsort(monty.wm_scores)[-4:][::-1]
+            for idx, c_i in enumerate(top_concepts):
+                sc = monty.wm_scores[c_i]
+                screen.blit(f_s.render(f"Concept #{c_i:02d}: {sc:5.1f}%", True, (200, 200, 220)), (dx_p + 12, dy_p + 180 + idx * 22))
+                pygame.draw.rect(screen, (30, 40, 50), (dx_p + 135, dy_p + 182 + idx * 22, 120, 10))
+                pygame.draw.rect(screen, (255, 60, 180), (dx_p + 135, dy_p + 182 + idx * 22, int((sc/100.0)*120), 10))
 
-                pygame.draw.rect(screen, (12, 16, 22), (rx, ry_ui, 650, 82), border_radius=6)
-                pygame.draw.rect(screen, col if is_lead else (45, 55, 65), (rx, ry_ui, 650, 82), 2 if is_lead else 1, border_radius=6)
+            # Панель 2: ЭЭГ Кинематика и Автономия
+            by_p = 445
+            pygame.draw.rect(screen, (14, 18, 26), (670, by_p, 725, 340), border_radius=6)
+            pygame.draw.rect(screen, (100, 255, 120) if AUTOPILOT_MODE else (60, 80, 100), (670, by_p, 725, 340), 2 if AUTOPILOT_MODE else 1, border_radius=6)
 
-                role_label = f"[{i+1}] {n.name}" + (" [ВЕДУЩИЙ ◄]" if is_lead else "")
-                screen.blit(f_b.render(role_label, True, col if is_lead else (130, 140, 150)), (rx + 15, ry_ui + 10))
+            auto_txt = "► АВТОПИЛОТ MONTY [АКТИВЕН]" if AUTOPILOT_MODE else "► ОБУЧЕНИЕ: ЧЕЛОВЕК-УЧИТЕЛЬ (FCz BCI)"
+            screen.blit(f_b.render(auto_txt, True, (255, 60, 180) if AUTOPILOT_MODE else (0, 255, 200)), (690, by_p + 15))
+            screen.blit(f_b.render(f"ГОТОВНОСТЬ АВТОНОМИИ: {monty.autonomy_score:.1f}%", True, (255, 255, 255)), (690, by_p + 40))
 
-                ax_node = n.gamepad_axes
-                screen.blit(f_s.render(f"Оси: Lx={ax_node.lx:+.2f}, Ly={-ax_node.ly:+.2f} | rx={ax_node.rx:+.2f}", True, (160, 170, 180)), (rx + 15, ry_ui + 32))
-                screen.blit(f_s.render(f"Вихрь Tq: {n.tq:+.2f} | Тяга: {n.thrust:.2f} | Тета-часы: {frame.theta_freq:.2f} Гц", True, (160, 170, 180)), (rx + 15, ry_ui + 52))
+            pygame.draw.rect(screen, (30, 40, 50), (690, by_p + 65, 400, 16), border_radius=4)
+            pygame.draw.rect(screen, (255, 60, 180) if AUTOPILOT_MODE else (0, 255, 200), (690, by_p + 65, int((monty.autonomy_score / 100.0) * 400), 16), border_radius=4)
 
-                cx_radar, cy_radar, rc = rx + 570, ry_ui + 41, 30
-                pygame.draw.circle(screen, (20, 28, 38), (cx_radar, cy_radar), rc, 1)
-                pygame.draw.line(screen, (30, 40, 50), (cx_radar - rc, cy_radar), (cx_radar + rc, cy_radar), 1)
-                pygame.draw.line(screen, (30, 40, 50), (cx_radar, cy_radar - rc), (cx_radar, cy_radar + rc), 1)
+            screen.blit(f_s.render(f"• Координаты тела: Fwd={drive_fwd:+.2f} | Strafe={drive_str:+.2f} | Угол={math.degrees(avatar.angle):.0f}°", True, (200, 220, 255)), (690, by_p + 95))
+            screen.blit(f_s.render(f"• Намерение Человека (Бирюзовый): Fwd={human_fwd:+.2f}, Str={human_str:+.2f}", True, (0, 255, 255)), (690, by_p + 115))
+            screen.blit(f_s.render(f"• Вывод Action Head (Пурпурный): Fwd={monty_fwd:+.2f}, Str={monty_str:+.2f}", True, (255, 60, 180)), (690, by_p + 135))
+            screen.blit(f_s.render("• Управление: Вперед/Назад (W/S), Стрейф (A/D), Поворот (Q/E или сагитта rx)", True, (160, 180, 200)), (690, by_p + 155))
 
-                nbx, nby = ax_node.lx, -ax_node.ly
-                n_len = math.hypot(nbx, nby)
-                if n_len > 1.0: nbx /= n_len; nby /= n_len
-                pygame.draw.line(screen, (255, 220, 0), (cx_radar, cy_radar), (cx_radar + int(nbx * (rc - 4)), cy_radar + int(nby * (rc - 4))), 2)
-                pygame.draw.circle(screen, (255, 255, 255), (cx_radar + int(nbx * (rc - 4)), cy_radar + int(nby * (rc - 4))), 3)
+            # Спектр 120 ребер ciPLV
+            screen.blit(f_s.render("120-EDGE DIRECTED ciPLV СЕТЬ (FCz):", True, (150, 160, 170)), (690, by_p + 185))
+            g120 = np.abs(lead_node.iplv_gamma[-1])
+            max_g = np.max(g120) + 1e-6
+            for p in range(120):
+                bh = int((g120[p] / max_g) * 65)
+                col_b = (255, 80, 80) if p < 6 else ((80, 255, 120) if p < 72 else (80, 150, 255))
+                pygame.draw.rect(screen, col_b, (690 + p * 5.8, by_p + 270 - bh, 4, bh))
 
             fps_val = clock.get_fps()
-            screen.blit(f_b.render(f"NEUROCANVAS × MONTY | SENSOR/GOAL SEPARATION & AUTONOMY | {fps_val:.0f} FPS", True, (255, 255, 255)), (30, 15))
+            screen.blit(f_b.render(f"FPS: {fps_val:.0f} | [SPACE] Автопилот | [Q/E] Поворот | [R] Ресет", True, (255, 255, 255)), (30, 15))
 
             pygame.display.flip()
 

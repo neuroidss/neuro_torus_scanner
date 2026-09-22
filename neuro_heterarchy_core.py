@@ -75,12 +75,11 @@ DX_PAIR_WEIGHTED = DX_PAIR_136 * ANISOTROPY_GAIN_X
 DY_PAIR_WEIGHTED = DY_PAIR_136 * ANISOTROPY_GAIN_Y
 NORM_DIVISOR = float(len(DX_PAIR_136))
 
-# Проекционная матрица для 2D вектора (детерминированный seed 42)
-np.random.seed(42)
-PROJ_MATRICES = np.stack([
-    np.linalg.qr(np.random.randn(NUM_PAIRS, NUM_PAIRS))[0][:2, :].T 
-    for _ in range(NUM_MAX_DEVICES)
-], axis=0).astype(np.float32)
+# 100% детерминированная физическая проекция (на основе векторов между электродами)
+norm_dx = DX_120 / (np.linalg.norm(DX_120) + 1e-6)
+norm_dy = DY_120 / (np.linalg.norm(DY_120) + 1e-6)
+PHYSICAL_PROJ = np.stack([norm_dx, norm_dy], axis=1).astype(np.float32) # [120, 2]
+PROJ_MATRICES = np.stack([PHYSICAL_PROJ for _ in range(NUM_MAX_DEVICES)], axis=0)
 
 # Подготовка GPU-тензоров
 DX_GPU_136 = torch.from_numpy(DX_PAIR_WEIGHTED).to(DEVICE)

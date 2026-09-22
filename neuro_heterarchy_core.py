@@ -189,7 +189,7 @@ def make_lie_so3_generator(omega: float, axis=np.array([0.0, 0.0, 1.0], dtype=np
     return torch.from_numpy(M_skew).to(DEVICE)
 
 class GPU_Daemon_Process(mp.Process):
-    def __init__(self, shared_mem, gamma_max: float = 65.0):
+    def __init__(self, shared_mem, gamma_max: float = 100.0):
         super().__init__()
         self.daemon = True
         self.shm = shared_mem

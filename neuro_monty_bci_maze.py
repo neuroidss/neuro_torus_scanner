@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-🧠 NEUROCANVAS: STABLE PREDICTIVE MONTY BCI (NLMS STABILITY)
-- Устранена нестабильность градиента: внедрен Normalized LMS (NLMS).
-- Аномалия гарантированно держится в диапазоне 0.005 - 0.040 без взрывов до 7000.
-- Устранена инверсия на 180°: SDR строго бинарный (80 активных единиц, 4016 чистых нулей).
+🧠 NEUROCANVAS: STABLE PREDICTIVE MONTY BCI (EXACT WEB ENGINE PORT)
+- Полный порт физики, масштабов и сглаживания из EngineConfig.ts и BrainMazeScene.tsx.
+- Лабиринт динамически центрируется и гарантированно 100% влезает в окно.
+- Генерация лабиринта и выхода 1:1 из maze.ts (алгоритм findHardestExit, 200 попыток).
+- Все настройки вынесены в CLI-параметры.
+- Зафиксированы значения по умолчанию: --hide-path True, --vec-scale 80.0.
 """
 
 import os
@@ -19,14 +21,19 @@ from collections import deque
 
 from neuro_heterarchy_core import HeterarchicalBrainEngine, DEVICE, COORDS_X, COORDS_Y, PROJ_MATRICES
 
+# Геометрия окна
 DIM = 13
-CELL_SIZE = 45
-MAZE_W = DIM * CELL_SIZE
-MAZE_H = DIM * CELL_SIZE
+MAZE_AREA_W = 620
+MAZE_AREA_H = 620
+CELL_SIZE = int((MAZE_AREA_W - 40) / DIM)  # ~44 пикселя на клетку
+GRID_PX_W = DIM * CELL_SIZE
+GRID_PX_H = DIM * CELL_SIZE
+OFFSET_X = (MAZE_AREA_W - GRID_PX_W) // 2
+OFFSET_Y = (MAZE_AREA_H - GRID_PX_H) // 2
 UI_W = 680
 
 # ==============================================================================
-# CANONICAL HTM С ЧИСТЫМ БИНАРНЫМ SDR (БЕЗ ФОНОВОГО ШУМА 0.01)
+# CANONICAL HTM С ЧИСТЫМ БИНАРНЫМ SDR
 # ==============================================================================
 class CanonicalHTMColumn(nn.Module):
     def __init__(self, num_columns=4096, k_active=80, num_slots=32):
@@ -51,44 +58,90 @@ class CanonicalHTMColumn(nn.Module):
         self.perm_threshold = 0.25
 
     def compute_sdr(self, pac_iplv_32x120: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Двухканальная ON/OFF поляризация сохраняет 360° фазовый угол
         x_pos = torch.relu(pac_iplv_32x120)
         x_neg = torch.relu(-pac_iplv_32x120)
-        
         conn_pos = (self.permanence_pos >= self.perm_threshold).float()
         conn_neg = (self.permanence_neg >= self.perm_threshold).float()
-        
         overlap = (torch.matmul(x_pos, conn_pos.T) + torch.matmul(x_neg, conn_neg.T)) / 20.0
         _, active_indices = torch.topk(overlap, self.k_active, dim=-1)
-        
-        # СТРОГО НУЛИ: неактивные нейроны не должны вносить шум и дестабилизировать веса!
         sdr_seq = torch.zeros((self.num_slots, self.num_columns), device=DEVICE)
         sdr_seq.scatter_(1, active_indices, 1.0)
         return sdr_seq, sdr_seq[-1]
 
 # ==============================================================================
-# ТОПОЛОГИЧЕСКИЙ ЛАБИРИНТ С НЕПРЕРЫВНЫМ 360° ГРАДИЕНТОМ
+# ТОПОЛОГИЧЕСКИЙ ЛАБИРИНТ (ТОЧНЫЙ ПОРТ ИЗ maze.ts)
 # ==============================================================================
 class TopoMazeWithBFS:
     def __init__(self, dim=DIM):
         self.dim = dim if dim % 2 != 0 else dim + 1
-        self.grid = [[1 for _ in range(self.dim)] for _ in range(self.dim)]
-        self._gen(1, 1)
-        self.exit_pos = (self.dim - 2, self.dim - 2)
+        self.grid = []
+        self.exit_pos = (1, 1)
+        self.optimal_dist = 0
+        
+        attempts = 0
+        is_valid = False
+        best_exit = None
+        best_grid = None
+
+        # Точный алгоритм findHardestExit из maze.ts (200 попыток)
+        while not is_valid and attempts < 200:
+            attempts += 1
+            self.grid = [[1 for _ in range(self.dim)] for _ in range(self.dim)]
+            self._gen(1, 1)
+            
+            exit_params = self._find_hardest_exit()
+            if not best_exit or (exit_params['d'] + exit_params['turns'] > best_exit['d'] + best_exit['turns']):
+                best_exit = exit_params
+                best_grid = [row[:] for row in self.grid]
+            
+            if exit_params['d'] >= 20 and exit_params['turns'] >= 5:
+                is_valid = True
+
+        self.grid = best_grid
+        self.exit_pos = (best_exit['x'], best_exit['y'])
+        self.optimal_dist = best_exit['d']
         self.grid[self.exit_pos[1]][self.exit_pos[0]] = 2
-        self.grid[self.exit_pos[1] - 1][self.exit_pos[0]] = 0
+        
         self.distance_field = self._build_distance_field()
 
     def _gen(self, x, y):
         self.grid[y][x] = 0
-        dirs = [(0, -1), (1, 0), (0, 1), (-1, 0)]
-        np.random.seed(int(x * 100 + y * 10))
+        dirs = [(0, 1), (0, -1), (1, 0), (-1, 0)]
         np.random.shuffle(dirs)
         for dx, dy in dirs:
-            nx, ny = x + dx * 2, y + dy * 2
+            nx = x + dx * 2
+            ny = y + dy * 2
             if 0 < nx < self.dim - 1 and 0 < ny < self.dim - 1 and self.grid[ny][nx] == 1:
                 self.grid[y + dy][x + dx] = 0
                 self._gen(nx, ny)
+
+    def _find_hardest_exit(self):
+        q = deque([{'x': 1, 'y': 1, 'd': 0, 'dx': 0, 'dy': 0, 'turns': 0}])
+        visited = [[False]*self.dim for _ in range(self.dim)]
+        visited[1][1] = True
+        best = {'x': 1, 'y': 1, 'd': 0, 'turns': 0}
+        max_score = 0
+
+        while q:
+            curr = q.popleft()
+            score = curr['d'] + curr['turns'] * 3
+            if score > max_score and (curr['x'] != 1 or curr['y'] != 1):
+                max_score = score
+                best = curr
+
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = curr['x'] + dx, curr['y'] + dy
+                if 0 < nx < self.dim - 1 and 0 < ny < self.dim - 1:
+                    if not visited[ny][nx] and self.grid[ny][nx] == 0:
+                        visited[ny][nx] = True
+                        is_turn = (curr['dx'] != 0 or curr['dy'] != 0) and (curr['dx'] != dx or curr['dy'] != dy)
+                        q.append({
+                            'x': nx, 'y': ny, 
+                            'd': curr['d'] + 1, 
+                            'dx': dx, 'dy': dy, 
+                            'turns': curr['turns'] + (1 if is_turn else 0)
+                        })
+        return best
 
     def _build_distance_field(self):
         df = np.full((self.dim, self.dim), 9999.0)
@@ -140,15 +193,99 @@ class TopoMazeWithBFS:
         dx_grid = target_pt[0] - x
         dy_grid = target_pt[1] - y
         d = math.hypot(dx_grid, dy_grid) + 1e-6
-        
-        fx = dx_grid / d
-        fy = -dy_grid / d  # Инверсия строки сетки в положительный декартов Y (вперед)
-        return fx, fy, path
+        # +X = Вправо, +Y = Вниз по экрану
+        return dx_grid / d, dy_grid / d, path
 
     def is_wall(self, gx: float, gy: float) -> bool:
         ix, iy = int(math.floor(gx)), int(math.floor(gy))
         if ix < 0 or ix >= self.dim or iy < 0 or iy >= self.dim: return True
         return self.grid[iy][ix] == 1
+
+# ==============================================================================
+# АВАТАР (ТОЧНЫЙ ПОРТ КИНЕМАТИКИ ИЗ BrainMazeScene.tsx + EngineConfig.ts)
+# ==============================================================================
+class Avatar3D:
+    def __init__(self, sensitivity=0.05, max_speed=0.15, fwd_scale=0.2, strafe_scale=0.2, turn_scale=0.5, intent_gain=1.5):
+        self.x, self.y = 1.5, 1.5
+        self.angle = 0.0
+        
+        # Настройки из EngineConfig.Maze
+        self.sensitivity = sensitivity
+        self.max_speed = max_speed
+        self.forward_speed_scale = fwd_scale
+        self.strafe_speed_scale = strafe_scale
+        self.turn_speed_scale = turn_scale
+        self.intent_gain = intent_gain
+        
+        # Leaky-интеграторы (BrainMazeScene.tsx)
+        self.ctrl_moveX = 0.0
+        self.ctrl_moveY = 0.0
+        self.ctrl_torque = 0.0
+        
+        self.last_ix = 0.0
+        self.last_iy = 0.0
+        self.persistence = 0.0
+        self.trail = []
+        
+    def update_motion(self, dt, intent_x, intent_y, intent_tq, maze, rotating_view):
+        # 1. Расчет Persistence (BleService.ts)
+        mag = math.hypot(intent_x, intent_y)
+        dot = intent_x * self.last_ix + intent_y * self.last_iy
+        cos_th = dot / (mag * math.hypot(self.last_ix, self.last_iy) + 1e-6)
+        
+        if mag > 0.05 and cos_th > 0.8:
+            self.persistence = min(1.0, self.persistence + 0.05)
+        else:
+            self.persistence *= 0.95
+            
+        self.last_ix = intent_x
+        self.last_iy = intent_y
+
+        # 2. Мягкое сглаживание в точности как в BrainMazeScene.tsx
+        skill_level = self.sensitivity
+        smooth = 0.98 - (skill_level * 0.1)
+        gain = skill_level * self.intent_gain
+        active_boost = 1.0 + self.persistence * 4.0
+        
+        self.ctrl_moveX = self.ctrl_moveX * smooth + intent_x * gain * (1.0 - smooth)
+        self.ctrl_moveY = self.ctrl_moveY * smooth + intent_y * gain * (1.0 - smooth)
+        self.ctrl_torque = self.ctrl_torque * smooth + intent_tq * gain * 0.5 * (1.0 - smooth)
+
+        # 3. Вращение
+        if rotating_view:
+            self.angle += self.ctrl_torque * active_boost * self.turn_speed_scale
+            self.angle = (self.angle + math.pi) % (2.0 * math.pi) - math.pi
+            
+            forward_speed = -self.ctrl_moveY * self.forward_speed_scale * active_boost
+            strafe_speed = self.ctrl_moveX * self.strafe_speed_scale * active_boost
+
+            raw_dx = math.sin(self.angle) * forward_speed + math.cos(self.angle) * strafe_speed
+            raw_dy = -math.cos(self.angle) * forward_speed + math.sin(self.angle) * strafe_speed
+        else:
+            self.angle += self.ctrl_torque * active_boost * 0.5
+            self.angle = (self.angle + math.pi) % (2.0 * math.pi) - math.pi
+            
+            raw_dx = self.ctrl_moveX * self.strafe_speed_scale * active_boost
+            raw_dy = self.ctrl_moveY * self.forward_speed_scale * active_boost
+
+        # 4. Ограничение предельной скорости (maxSpeed из EngineConfig)
+        intended_move = math.hypot(raw_dx, raw_dy)
+        target_dx, target_dy = raw_dx, raw_dy
+        if intended_move > self.max_speed:
+            target_dx = (raw_dx / intended_move) * self.max_speed
+            target_dy = (raw_dy / intended_move) * self.max_speed
+
+        # 5. Проход по шагам с коллизиями (строка 157 BrainMazeScene.tsx)
+        steps = max(1, int(math.ceil(max(abs(target_dx), abs(target_dy)) / 0.05)))
+        sdx = target_dx / steps
+        sdy = target_dy / steps
+
+        for _ in range(steps):
+            if not maze.is_wall(self.x + sdx + math.copysign(0.2, sdx), self.y): self.x += sdx
+            if not maze.is_wall(self.x, self.y + sdy + math.copysign(0.2, sdy)): self.y += sdy
+            
+        self.trail.append((self.x, self.y))
+        if len(self.trail) > 30: self.trail.pop(0)
 
 # ==============================================================================
 # ПРЕДИКТИВНЫЙ МОНТИ (СТАБИЛЬНЫЙ NORMALIZED LMS)
@@ -161,53 +298,73 @@ class PredictiveMonty(nn.Module):
         self.proj_matrix = torch.from_numpy(PROJ_MATRICES[0]).to(DEVICE)
         self.last_sdr = None
 
-    def learn_and_predict(self, real_pac: torch.Tensor, ideal_fx: float, ideal_fy: float):
+    def learn_and_predict(self, real_pac: torch.Tensor, ideal_x: float, ideal_y: float):
         with torch.no_grad():
-            ctx_vec = torch.tensor([ideal_fx, ideal_fy], dtype=torch.float32, device=DEVICE)
-            
+            ctx_vec = torch.tensor([ideal_x, ideal_y], dtype=torch.float32, device=DEVICE)
             sdr_seq, sdr_last = self.htm.compute_sdr(real_pac)
             self.last_sdr = sdr_last.view(64, 64)
-            sdr_state = torch.mean(sdr_seq, dim=0) # [4096]
+            sdr_state = torch.mean(sdr_seq, dim=0)
+            state = torch.cat([sdr_state, ctx_vec])
             
-            state = torch.cat([sdr_state, ctx_vec]) # [4098]
-            
-            # Предсказание матрицы когерентности
             pred_pac_flat = torch.matmul(self.W_out, state)
             pred_pac = pred_pac_flat.view(32, 120)
             
-            # Ошибка предсказания
             error = real_pac.view(-1) - pred_pac_flat
             loss = torch.mean(error**2).item()
             
-            # =================================================================
-            # АБСОЛЮТНО УСТОЙЧИВЫЙ ШАГ ОБУЧЕНИЯ (NORMALIZED LMS / OJA)
-            # Гарантирует, что шаг никогда не превысит предел устойчивости Ляпунова
-            # =================================================================
             state_energy = torch.sum(state ** 2) + 1e-4
-            eta = 0.08 / state_energy # Эффективный шаг строго фиксирован на уровне 8% за кадр
-            
+            eta = 0.08 / state_energy
             self.W_out += eta * torch.outer(error, state)
-            self.W_out *= 0.9995 # Защита от неограниченного дрейфа весов
+            self.W_out *= 0.9995
             
-            # Декодирование кинематики Монти через физическую матрицу
             pred_traj_2d = torch.matmul(pred_pac, self.proj_matrix) * 10.0
             base_x, base_y = pred_traj_2d[0, 0], pred_traj_2d[0, 1]
             end_x = pred_traj_2d[-1, 0] - base_x
             end_y = pred_traj_2d[-1, 1] - base_y
             
             d_len = math.hypot(end_x.item(), end_y.item()) + 1e-6
-            monty_lx = end_x.item() / d_len
-            monty_ly = end_y.item() / d_len
+            monty_x = end_x.item() / d_len
+            monty_y = -end_y.item() / d_len
             
-            return pred_pac, monty_lx, monty_ly, loss
+            return pred_pac, monty_x, monty_y, loss
+
+def get_screen_coords(wx, wy, avatar, rotating_view):
+    """ Проекция: лабиринт всегда центрирован и полностью виден в окне. """
+    if not rotating_view:
+        return (int(OFFSET_X + wx * CELL_SIZE), int(OFFSET_Y + wy * CELL_SIZE))
+        
+    cx_ui = MAZE_AREA_W // 2
+    cy_ui = MAZE_AREA_H // 2
+    dx = wx - avatar.x
+    dy = wy - avatar.y
+    
+    rot = -avatar.angle
+    sx = dx * math.cos(rot) - dy * math.sin(rot)
+    sy = dx * math.sin(rot) + dy * math.cos(rot)
+    
+    return (int(cx_ui + sx * CELL_SIZE), int(cy_ui + sy * CELL_SIZE))
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--sim', action='store_true', default=False)
+    parser.add_argument('--rotate', action='store_true', default=False, help="Включить вращающийся мир по умолчанию")
+    parser.add_argument('--hide-path', action='store_true', default=True, help="Скрыть зеленую линию пути и вектор")
+    parser.add_argument('--vec-scale', type=float, default=80.0, help="Длина векторов нейрофидбека (по умолчанию 80)")
+    parser.add_argument('--hide-trail', action='store_true', default=True, help="Скрыть синий хвост")
+    parser.add_argument('--hide-monty', action='store_true', default=True, help="Скрыть розовый вектор Монти")
+    
+    # Настройки из EngineConfig.ts
+    parser.add_argument('--sensitivity', type=float, default=0.05, help="moveSensitivity из веба (по умолчанию 0.05)")
+    parser.add_argument('--max-speed', type=float, default=0.15, help="maxSpeed из EngineConfig (по умолчанию 0.15)")
+    parser.add_argument('--fwd-scale', type=float, default=0.2, help="forwardSpeedScale из EngineConfig (по умолчанию 0.2)")
+    parser.add_argument('--strafe-scale', type=float, default=0.2, help="strafeSpeedScale из EngineConfig (по умолчанию 0.2)")
+    parser.add_argument('--turn-scale', type=float, default=0.5, help="turnSpeedScale из EngineConfig (по умолчанию 0.5)")
+    parser.add_argument('--intent-gain', type=float, default=1.5, help="intentGain из EngineConfig (по умолчанию 1.5)")
+    parser.add_argument('--intent-mag', type=float, default=15.0, help="intentMoveMagnitude для клавиатуры (по умолчанию 15.0)")
     args = parser.parse_args()
 
     pygame.init()
-    screen = pygame.display.set_mode((MAZE_W + UI_W, MAZE_H))
+    screen = pygame.display.set_mode((MAZE_AREA_W + UI_W, MAZE_AREA_H))
     pygame.display.set_caption(f"NeuroCanvas: Stable NLMS Monty [{DEVICE}]")
     font = pygame.font.SysFont("consolas", 13, bold=True)
     font_lg = pygame.font.SysFont("consolas", 18, bold=True)
@@ -227,11 +384,22 @@ def main():
             time.sleep(0.1)
 
     maze = TopoMazeWithBFS(DIM)
-    x, y = 1.5, 1.5
-    vx, vy = 0.0, 0.0
+    avatar = Avatar3D(
+        sensitivity=args.sensitivity,
+        max_speed=args.max_speed,
+        fwd_scale=args.fwd_scale,
+        strafe_scale=args.strafe_scale,
+        turn_scale=args.turn_scale,
+        intent_gain=args.intent_gain
+    )
     monty = PredictiveMonty()
 
     AUTOPILOT = False
+    ROTATING_VIEW = args.rotate
+    SHOW_PATH = not args.hide_path
+    SHOW_TRAIL = not args.hide_trail
+    SHOW_MONTY = not args.hide_monty
+    VEC_SCALE = args.vec_scale
 
     try:
         while True:
@@ -242,94 +410,145 @@ def main():
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_SPACE:
                         AUTOPILOT = not AUTOPILOT
-                    elif event.key == pygame.K_r:
+                    elif event.key == pygame.K_F3:
+                        ROTATING_VIEW = not ROTATING_VIEW
+                    elif event.key == pygame.K_F4:
                         maze = TopoMazeWithBFS(DIM)
-                        x, y = 1.5, 1.5
+                        avatar.x, avatar.y = 1.5, 1.5
+                        avatar.angle = 0.0
+                        avatar.trail.clear()
+                    elif event.key == pygame.K_F5:
+                        SHOW_PATH = not SHOW_PATH
+                    elif event.key == pygame.K_F6:
+                        SHOW_TRAIL = not SHOW_TRAIL
+                    elif event.key == pygame.K_F7:
+                        SHOW_MONTY = not SHOW_MONTY
 
             frame = engine.get_frame()
 
             if frame.num_live == 0:
                 screen.fill((14, 18, 26))
-                screen.blit(font_lg.render("WAITING FOR LSL STREAM...", True, (255, 80, 80)), (MAZE_W//2 - 120, MAZE_H//2))
+                screen.blit(font_lg.render("WAITING FOR LSL STREAM...", True, (255, 80, 80)), (MAZE_AREA_W//2 - 120, MAZE_AREA_H//2))
                 pygame.display.flip()
                 time.sleep(0.1)
                 continue
 
-            # 1. ИДЕАЛЬНЫЙ 360° ВЕКТОР (+fy вперед/вверх, -fy назад/вниз, +fx вправо)
-            ideal_fx, ideal_fy, lookahead_path = maze.get_continuous_360_gradient(x, y, lookahead_dist=2.2)
+            # 1. ИДЕАЛЬНЫЙ ВЕКТОР (dx вправо, dy вниз)
+            ideal_x, ideal_y, lookahead_path = maze.get_continuous_360_gradient(avatar.x, avatar.y, lookahead_dist=2.2)
 
             if agent:
-                agent.update_target(ideal_fx, ideal_fy)
+                agent.update_target(ideal_x, -ideal_y)
 
-            # 2. РЕАЛЬНОЕ ИЗВЛЕЧЕНИЕ ИЗ LSL (С компенсацией скрытого минуса ядра ly=-ly)
+            # 2. ИЗВЛЕЧЕНИЕ СЫРЫХ LSL ПАРАМЕТРОВ (Только Тета-Гамма)
             real_pac = torch.tensor(frame.fcz_macro.iplv_32, dtype=torch.float32, device=DEVICE)
-            real_fx = frame.fcz_macro.gamepad_axes.lx
-            real_fy = -frame.fcz_macro.gamepad_axes.ly
+            real_x = frame.fcz_macro.gamepad_axes.lx
+            real_y = frame.fcz_macro.gamepad_axes.ly  # Синхронизированный знак: -1 это ВВЕРХ
+            real_tq = frame.fcz_macro.gamepad_axes.rx
 
-            # 3. МОНТИ: ОБУЧЕНИЕ И ДЕКОДИРОВАНИЕ (СТАБИЛЬНЫЙ NLMS)
-            pred_pac, monty_fx, monty_fy, anomaly_loss = monty.learn_and_predict(
-                real_pac, ideal_fx, ideal_fy
+            # 3. МОНТИ: ОБУЧЕНИЕ И ДЕКОДИРОВАНИЕ
+            pred_pac, monty_x, monty_y, anomaly_loss = monty.learn_and_predict(
+                real_pac, ideal_x, ideal_y
             )
 
-            # 4. ДВИЖЕНИЕ
-            drive_fx = monty_fx if AUTOPILOT else real_fx
-            drive_fy = monty_fy if AUTOPILOT else real_fy
+            # 4. ВЫБОР ИСТОЧНИКА ДВИЖЕНИЯ
+            # В вебе сырой интент умножается на intentMoveMagnitude для клавиатуры
+            drive_x = (monty_x if AUTOPILOT else real_x) * args.intent_mag
+            drive_y = (monty_y if AUTOPILOT else real_y) * args.intent_mag
+            drive_tq = real_tq * args.turn_scale
 
-            vx = vx * 0.75 + (drive_fx * 3.5) * 0.25
-            vy = vy * 0.75 + (drive_fy * 3.5) * 0.25
+            # Ручной override со стрелок и точек/запятых
+            keys = pygame.key.get_pressed()
+            if keys[pygame.K_UP]:     drive_y -= args.intent_mag
+            if keys[pygame.K_DOWN]:   drive_y += args.intent_mag
+            if keys[pygame.K_RIGHT]:  drive_x += args.intent_mag
+            if keys[pygame.K_LEFT]:   drive_x -= args.intent_mag
+            if keys[pygame.K_PERIOD]: drive_tq += 2.0
+            if keys[pygame.K_COMMA]:  drive_tq -= 2.0
 
-            move_dist = math.hypot(vx, vy) * dt
-            steps = max(1, int(math.ceil(move_dist / 0.05)))
-            r = 0.25 
-            for _ in range(steps):
-                step_dx = (vx * dt) / steps
-                step_dy = -(vy * dt) / steps # Инверсия строки для движения вверх
-                
-                if not maze.is_wall(x + step_dx + math.copysign(r, step_dx), y): x += step_dx
-                if not maze.is_wall(x, y + step_dy + math.copysign(r, step_dy)): y += step_dy
+            # 5. ДВИЖЕНИЕ АВАТАРА (через сглаживание BrainMazeScene.tsx)
+            avatar.update_motion(dt, drive_x, drive_y, drive_tq, maze, ROTATING_VIEW)
 
-            if int(x) == maze.exit_pos[0] and int(y) == maze.exit_pos[1]:
-                maze = TopoMazeWithBFS(DIM)
-                x, y = 1.5, 1.5
+            # 6. ПРОВЕРКА ВЫХОДА (строка 317 BrainMazeScene.tsx)
+            px_cur = int(math.floor(avatar.x))
+            py_cur = int(math.floor(avatar.y))
+            if 0 <= py_cur < maze.dim and 0 <= px_cur < maze.dim:
+                if maze.grid[py_cur][px_cur] == 2:
+                    maze = TopoMazeWithBFS(DIM)
+                    avatar.x, avatar.y = 1.5, 1.5
+                    avatar.angle = 0.0
+                    avatar.trail.clear()
 
             # ==================================================================
             # РЕНДЕРИНГ
             # ==================================================================
             screen.fill((8, 11, 16))
 
+            # Рамка лабиринта
+            pygame.draw.rect(screen, (16, 24, 34), (OFFSET_X - 2, OFFSET_Y - 2, GRID_PX_W + 4, GRID_PX_H + 4), 1)
+
             for gy in range(maze.dim):
                 for gx in range(maze.dim):
-                    rect = (gx * CELL_SIZE, gy * CELL_SIZE, CELL_SIZE, CELL_SIZE)
                     if maze.grid[gy][gx] == 1:
-                        pygame.draw.rect(screen, (24, 32, 46), rect)
+                        p0 = get_screen_coords(gx, gy, avatar, ROTATING_VIEW)
+                        p1 = get_screen_coords(gx + 1, gy, avatar, ROTATING_VIEW)
+                        p2 = get_screen_coords(gx + 1, gy + 1, avatar, ROTATING_VIEW)
+                        p3 = get_screen_coords(gx, gy + 1, avatar, ROTATING_VIEW)
+                        
+                        # Эффект свечения стен из веба (от persistence)
+                        gb_val = int(40 + avatar.persistence * 110)
+                        pygame.draw.polygon(screen, (10, gb_val, int(70 + avatar.persistence * 120)), [p0, p1, p2, p3])
+                        pygame.draw.polygon(screen, (34, 211, 238), [p0, p1, p2, p3], 1)
                     elif maze.grid[gy][gx] == 2:
-                        pygame.draw.rect(screen, (0, 255, 120), rect)
+                        c = get_screen_coords(gx + 0.5, gy + 0.5, avatar, ROTATING_VIEW)
+                        pygame.draw.circle(screen, (0, 255, 102), c, int(CELL_SIZE * 0.45))
+                        pygame.draw.circle(screen, (255, 255, 255), c, int(CELL_SIZE * 0.15))
 
-            if len(lookahead_path) > 1:
-                pts = [(int(px * CELL_SIZE), int(py * CELL_SIZE)) for px, py in lookahead_path]
-                pygame.draw.lines(screen, (0, 180, 80), False, pts, 2)
+            if SHOW_PATH and len(lookahead_path) > 1:
+                pts = [get_screen_coords(px, py, avatar, ROTATING_VIEW) for px, py in lookahead_path]
+                pygame.draw.lines(screen, (0, 180, 80), False, pts, 3)
 
-            ax, ay = int(x * CELL_SIZE), int(y * CELL_SIZE)
-            pygame.draw.circle(screen, (255, 255, 255), (ax, ay), 10)
+            # Синий след (скрыт по умолчанию, переключается по F6)
+            if SHOW_TRAIL and len(avatar.trail) > 1:
+                trail_pts = [get_screen_coords(tx, ty, avatar, ROTATING_VIEW) for tx, ty in avatar.trail]
+                t_col = (255, 80, 200) if AUTOPILOT else (0, 180, 255)
+                pygame.draw.lines(screen, t_col, False, trail_pts, 2)
 
-            # Стрелки на аватаре: ay - fy * L дает правильный вектор вверх при fy > 0
-            L = 35
-            pygame.draw.line(screen, (0, 255, 100), (ax, ay), (ax + int(ideal_fx * L), ay - int(ideal_fy * L)), 3)
-            pygame.draw.line(screen, (0, 255, 255), (ax, ay), (ax + int(real_fx * L), ay - int(real_fy * L)), 3)
-            pygame.draw.line(screen, (255, 60, 180), (ax, ay), (ax + int(monty_fx * L), ay - int(monty_fy * L)), 3)
+            a_sx, a_sy = get_screen_coords(avatar.x, avatar.y, avatar, ROTATING_VIEW)
+            
+            # Аватар
+            av_col = (0, int(150 + avatar.persistence * 105), 255) if not AUTOPILOT else (255, 50, 200)
+            pygame.draw.circle(screen, av_col, (a_sx, a_sy), int(CELL_SIZE * 0.28))
+            
+            # Направление взгляда (Нос)
+            if ROTATING_VIEW:
+                pygame.draw.line(screen, (255, 255, 255), (a_sx, a_sy), (a_sx, a_sy - 16), 3)
+            else:
+                nose_x = a_sx + int(math.sin(avatar.angle) * 16)
+                nose_y = a_sy - int(math.cos(avatar.angle) * 16)
+                pygame.draw.line(screen, (255, 255, 255), (a_sx, a_sy), (nose_x, nose_y), 3)
+
+            # Векторы намерений на экране
+            L = VEC_SCALE
+            if SHOW_PATH:
+                pygame.draw.line(screen, (0, 255, 100), (a_sx, a_sy), (a_sx + int(ideal_x * L), a_sy + int(ideal_y * L)), 4)
+                
+            pygame.draw.line(screen, (0, 255, 255), (a_sx, a_sy), (a_sx + int(real_x * L), a_sy + int(real_y * L)), 4)
+            
+            if SHOW_MONTY:
+                pygame.draw.line(screen, (255, 60, 180), (a_sx, a_sy), (a_sx + int(monty_x * L), a_sy + int(monty_y * L)), 4)
 
             # ==================================================================
             # ПАНЕЛИ ИНТРОСПЕКЦИИ
             # ==================================================================
-            px = MAZE_W + 20
+            px = MAZE_AREA_W + 20
 
-            # А. Режим
             mode_color = (255, 60, 180) if AUTOPILOT else (0, 255, 255)
             mode_txt = "► AUTOPILOT: MONTY PREDICTION" if AUTOPILOT else "► TEACHING: 360° REAL LSL"
             screen.blit(font_lg.render(mode_txt, True, mode_color), (px, 20))
-            screen.blit(font.render(f"Device: {DEVICE.type.upper()} | Streams: {frame.num_live}", True, (150, 170, 190)), (px, 48))
+            
+            cam_mode = "EGO [ROTATING]" if ROTATING_VIEW else "WORLD [FIXED]"
+            screen.blit(font.render(f"Device: {DEVICE.type.upper()} | Streams: {frame.num_live} | CAM: {cam_mode}", True, (150, 170, 190)), (px, 48))
 
-            # Б. L4 SDR Карта
             sdr_box_y = 75
             pygame.draw.rect(screen, (16, 22, 32), (px, sdr_box_y, 160, 160), border_radius=4)
             pygame.draw.rect(screen, (0, 255, 200), (px, sdr_box_y, 160, 160), 1, border_radius=4)
@@ -341,7 +560,6 @@ def main():
                 surf_sdr_scaled = pygame.transform.scale(surf_sdr, (156, 156))
                 screen.blit(surf_sdr_scaled, (px + 2, sdr_box_y + 2))
 
-            # В. Круговой 360° Радар
             rcx, rcy, rad = px + 280, sdr_box_y + 80, 65
             pygame.draw.circle(screen, (16, 22, 32), (rcx, rcy), rad)
             pygame.draw.circle(screen, (40, 60, 85), (rcx, rcy), rad, 1)
@@ -349,28 +567,31 @@ def main():
             pygame.draw.line(screen, (30, 45, 60), (rcx, rcy - rad), (rcx, rcy + rad), 1)
             screen.blit(font.render("360° RADAR (N=Up)", True, (0, 255, 200)), (px + 225, sdr_box_y - 18))
 
-            pygame.draw.line(screen, (0, 255, 100), (rcx, rcy), (rcx + int(ideal_fx * (rad - 6)), rcy - int(ideal_fy * (rad - 6))), 3)
-            pygame.draw.line(screen, (0, 255, 255), (rcx, rcy), (rcx + int(real_fx * (rad - 6)), rcy - int(real_fy * (rad - 6))), 2)
-            pygame.draw.line(screen, (255, 60, 180), (rcx, rcy), (rcx + int(monty_fx * (rad - 6)), rcy - int(monty_fy * (rad - 6))), 2)
+            radar_scale = rad - 6
+            if SHOW_PATH:
+                pygame.draw.line(screen, (0, 255, 100), (rcx, rcy), (rcx + int(ideal_x * radar_scale), rcy + int(ideal_y * radar_scale)), 3)
+            pygame.draw.line(screen, (0, 255, 255), (rcx, rcy), (rcx + int(real_x * radar_scale), rcy + int(real_y * radar_scale)), 2)
+            if SHOW_MONTY:
+                pygame.draw.line(screen, (255, 60, 180), (rcx, rcy), (rcx + int(monty_x * radar_scale), rcy + int(monty_y * radar_scale)), 2)
 
-            # Г. 8-Румбовое распределение
             bar_x = px + 390
             compass_angles = [90, 45, 0, 315, 270, 225, 180, 135]
             compass_labels = ["N (Fwd)", "NE", "E (Rgt)", "SE", "S (Bwd)", "SW", "W (Lft)", "NW"]
             
-            target_deg = (math.degrees(math.atan2(ideal_fy, ideal_fx)) + 360) % 360
-            monty_deg = (math.degrees(math.atan2(monty_fy, monty_fx)) + 360) % 360
+            target_deg = (math.degrees(math.atan2(-ideal_y, ideal_x)) + 360) % 360
+            monty_deg = (math.degrees(math.atan2(-monty_y, monty_x)) + 360) % 360
 
             screen.blit(font.render("DIRECTIONAL MEMORY:", True, (255, 220, 100)), (bar_x, sdr_box_y - 18))
             for i, c_deg in enumerate(compass_angles):
-                diff = abs((target_deg - c_deg + 180) % 360 - 180)
-                sim = max(0.0, 1.0 - diff / 60.0)
                 by = sdr_box_y + i * 20
                 screen.blit(font.render(f"{compass_labels[i]:7s}", True, (180, 180, 200)), (bar_x, by))
                 pygame.draw.rect(screen, (24, 32, 46), (bar_x + 65, by + 2, 70, 10))
-                pygame.draw.rect(screen, (0, 255, 120) if sim > 0.5 else (100, 150, 255), (bar_x + 65, by + 2, int(sim * 70), 10))
+                
+                if SHOW_PATH:
+                    diff = abs((target_deg - c_deg + 180) % 360 - 180)
+                    sim = max(0.0, 1.0 - diff / 60.0)
+                    pygame.draw.rect(screen, (0, 255, 120) if sim > 0.5 else (100, 150, 255), (bar_x + 65, by + 2, int(sim * 70), 10))
 
-            # Д. ciPLV Спектр 120 ребер
             spec_y = 265
             screen.blit(font.render("120-EDGE ciPLV (Top: Real, Bottom: Monty)", True, (200, 220, 255)), (px, spec_y))
             pygame.draw.rect(screen, (16, 22, 32), (px, spec_y + 18, 540, 95), border_radius=4)
@@ -387,15 +608,21 @@ def main():
                 bh_m = min(40, max(0, int((pred_g120[p] / max_v) * 40)))
                 pygame.draw.rect(screen, (255, 60, 180), (bx, spec_y + 65, 3, bh_m))
 
-            # Е. Метрики точности (Стабильный MSE)
             met_y = 390
             col_anom = (100, 255, 100) if anomaly_loss < 0.05 else (255, 180, 50)
             screen.blit(font_lg.render(f"PAC Anomaly (MSE Loss): {anomaly_loss:.4f}", True, col_anom), (px, met_y))
             
-            angle_err = abs((monty_deg - target_deg + 180) % 360 - 180)
-            screen.blit(font.render(f"Target Heading : {target_deg:5.1f}° (360° Continuous)", True, (0, 255, 100)), (px, met_y + 30))
-            screen.blit(font.render(f"Monty Predicted: {monty_deg:5.1f}° | Angle Error: {angle_err:4.1f}°", True, (255, 60, 180)), (px, met_y + 50))
-            screen.blit(font.render("[SPACE] Toggle Autopilot   |   [R] New Maze", True, (150, 170, 200)), (px, met_y + 80))
+            if SHOW_PATH:
+                angle_err = abs((monty_deg - target_deg + 180) % 360 - 180)
+                screen.blit(font.render(f"Target Heading : {target_deg:5.1f}°", True, (0, 255, 100)), (px, met_y + 30))
+                screen.blit(font.render(f"Monty Predicted: {monty_deg:5.1f}° | Angle Error: {angle_err:4.1f}°", True, (255, 60, 180)), (px, met_y + 50))
+            else:
+                screen.blit(font.render("Target Heading : [HIDDEN BY F5]", True, (100, 150, 100)), (px, met_y + 30))
+                screen.blit(font.render(f"Monty Predicted: {monty_deg:5.1f}°", True, (255, 60, 180)), (px, met_y + 50))
+            
+            screen.blit(font.render(f"Persistence (Speed Boost): {avatar.persistence:.2f}", True, (255, 255, 100)), (px, met_y + 75))
+            screen.blit(font.render("[SPACE] Autopilot  | [F3] Cam | [F4] New Maze", True, (150, 170, 200)), (px, met_y + 95))
+            screen.blit(font.render("[F5] Path  | [F6] Trail  | [F7] Monty Vec", True, (150, 170, 200)), (px, met_y + 115))
 
             pygame.display.flip()
 
